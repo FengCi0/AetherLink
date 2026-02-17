@@ -13,8 +13,9 @@ use aetherlink_core::{
     sign_session_request, verify_session_accept, verify_session_request,
 };
 use aetherlink_proto::v1::{
-    ControlEnvelope, DeviceIdentity, Ping as ControlPing, Pong as ControlPong, ProtocolVersion,
-    RejectReason, SessionAccept, SessionReject, SessionRequest, SessionRole,
+    CandidateAnnouncement, CandidateType, ControlEnvelope, DeviceIdentity, NetworkCandidate,
+    Ping as ControlPing, Pong as ControlPong, ProtocolVersion, PunchSync, RejectReason,
+    SessionAccept, SessionClose, SessionReject, SessionRequest, SessionRole,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
@@ -148,6 +149,13 @@ struct Args {
         help = "Control keepalive max consecutive misses before disconnect"
     )]
     control_keepalive_max_misses: u32,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Auto send SessionClose after session active duration (0 to disable)"
+    )]
+    session_auto_close_ms: u64,
 }
 
 #[derive(NetworkBehaviour)]
@@ -257,6 +265,7 @@ async fn main() -> Result<()> {
         args.control_keepalive_interval_ms,
         args.control_keepalive_timeout_ms,
         args.control_keepalive_max_misses,
+        args.session_auto_close_ms,
     );
 
     if !app.connect_device_codes.is_empty() {
@@ -297,6 +306,7 @@ async fn main() -> Result<()> {
                 handle_pending_session_timeouts(&mut swarm, &mut app);
                 handle_discovery_tick(&mut swarm, &mut app);
                 handle_control_keepalive_tick(&mut swarm, &mut app);
+                handle_session_lifecycle_tick(&mut swarm, &mut app);
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -395,6 +405,10 @@ struct App {
     control_keepalive_max_misses: u32,
     pending_outbound_control_requests:
         HashMap<request_response::OutboundRequestId, OutboundControlRequestKind>,
+    session_started_unix_ms: HashMap<PeerId, i64>,
+    session_auto_close_ms: i64,
+    closing_peers: HashSet<PeerId>,
+    pending_punch_actions: Vec<PendingPunchAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +432,18 @@ struct ControlKeepaliveState {
 enum OutboundControlRequestKind {
     SessionRequest,
     KeepalivePing { seq: u64 },
+    SessionClose,
+    CandidateAnnouncement,
+    PunchSync,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPunchAction {
+    peer_id: PeerId,
+    session_id: String,
+    transaction_id: String,
+    start_after_unix_ms: i64,
+    attempt_index: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +472,7 @@ impl App {
         control_keepalive_interval_ms: u64,
         control_keepalive_timeout_ms: u64,
         control_keepalive_max_misses: u32,
+        session_auto_close_ms: u64,
     ) -> Self {
         let mut connect_device_codes = connect_device_codes
             .into_iter()
@@ -485,6 +512,10 @@ impl App {
             control_keepalive_timeout_ms: control_keepalive_timeout_ms.max(500) as i64,
             control_keepalive_max_misses: control_keepalive_max_misses.max(1),
             pending_outbound_control_requests: HashMap::new(),
+            session_started_unix_ms: HashMap::new(),
+            session_auto_close_ms: session_auto_close_ms as i64,
+            closing_peers: HashSet::new(),
+            pending_punch_actions: Vec::new(),
         }
     }
 
@@ -528,11 +559,19 @@ impl App {
     fn set_active_session(&mut self, peer_id: PeerId, session_id: String) {
         self.active_sessions.insert(peer_id, session_id);
         self.control_keepalive.entry(peer_id).or_default();
+        self.session_started_unix_ms
+            .insert(peer_id, unix_ms() as i64);
+        self.closing_peers.remove(&peer_id);
     }
 
     fn clear_active_session(&mut self, peer_id: PeerId) {
         self.active_sessions.remove(&peer_id);
         self.control_keepalive.remove(&peer_id);
+        self.session_started_unix_ms.remove(&peer_id);
+    }
+
+    fn mark_graceful_closing(&mut self, peer_id: PeerId) {
+        self.closing_peers.insert(peer_id);
     }
 
     fn note_control_pong(&mut self, peer_id: PeerId, pong: &ControlPong) -> Option<i64> {
@@ -630,6 +669,42 @@ impl App {
         (send_actions, lost_peers)
     }
 
+    fn collect_auto_close_actions(&self, now_unix_ms: i64) -> Vec<(PeerId, String)> {
+        if self.session_auto_close_ms <= 0 {
+            return Vec::new();
+        }
+        self.active_sessions
+            .iter()
+            .filter_map(|(peer_id, session_id)| {
+                let started = self
+                    .session_started_unix_ms
+                    .get(peer_id)
+                    .copied()
+                    .unwrap_or(0);
+                if started > 0 && now_unix_ms.saturating_sub(started) >= self.session_auto_close_ms
+                {
+                    Some((*peer_id, session_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn collect_due_punch_actions(&mut self, now_unix_ms: i64) -> Vec<PendingPunchAction> {
+        let mut due = Vec::new();
+        let mut pending = Vec::new();
+        for action in self.pending_punch_actions.drain(..) {
+            if action.start_after_unix_ms <= now_unix_ms {
+                due.push(action);
+            } else {
+                pending.push(action);
+            }
+        }
+        self.pending_punch_actions = pending;
+        due
+    }
+
     fn can_attempt_discovery_dial(&self, swarm: &Swarm<NodeBehaviour>, peer_id: PeerId) -> bool {
         if swarm.is_connected(&peer_id) {
             return false;
@@ -658,10 +733,16 @@ impl App {
     }
 
     fn on_disconnected(&mut self, peer_id: PeerId) {
+        let graceful = self.closing_peers.contains(&peer_id);
         self.pending_outbound_sessions.remove(&peer_id);
         self.clear_active_session(peer_id);
+        self.closing_peers.remove(&peer_id);
         if let Some(sm) = self.sessions.get_mut(&peer_id) {
-            let _ = sm.apply(Trigger::PathLost);
+            if graceful {
+                let _ = sm.apply(Trigger::UserHangup);
+            } else {
+                let _ = sm.apply(Trigger::PathLost);
+            }
         }
     }
 
@@ -753,7 +834,7 @@ async fn handle_behaviour_event(
                 request_id,
                 response,
             } => {
-                handle_control_response(app, peer, request_id, response)?;
+                handle_control_response(swarm, app, peer, request_id, response)?;
             }
         },
         NodeEvent::Control(request_response::Event::OutboundFailure {
@@ -776,6 +857,15 @@ async fn handle_behaviour_event(
                         );
                         let _ = swarm.disconnect_peer_id(peer);
                     }
+                }
+                Some(OutboundControlRequestKind::SessionClose) => {
+                    warn!("SessionClose outbound failed peer={peer}");
+                }
+                Some(OutboundControlRequestKind::CandidateAnnouncement) => {
+                    warn!("CandidateAnnouncement outbound failed peer={peer}");
+                }
+                Some(OutboundControlRequestKind::PunchSync) => {
+                    warn!("PunchSync outbound failed peer={peer}");
                 }
                 None => {
                     warn!("unknown outbound control request failed req={request_id:?}");
@@ -966,6 +1056,148 @@ fn send_control_ping(
         OutboundControlRequestKind::KeepalivePing { seq },
     );
     Ok(())
+}
+
+fn handle_session_lifecycle_tick(swarm: &mut Swarm<NodeBehaviour>, app: &mut App) {
+    let now_unix_ms = unix_ms() as i64;
+
+    for (peer_id, session_id) in app.collect_auto_close_actions(now_unix_ms) {
+        if let Err(err) = send_session_close(
+            swarm,
+            app,
+            peer_id,
+            &session_id,
+            "auto-close budget reached",
+        ) {
+            warn!("auto SessionClose failed peer={peer_id}: {err}");
+        }
+    }
+
+    for action in app.collect_due_punch_actions(now_unix_ms) {
+        if swarm.is_connected(&action.peer_id) {
+            continue;
+        }
+        info!(
+            "executing PunchSync action peer={} tx={} attempt={} session={}",
+            action.peer_id, action.transaction_id, action.attempt_index, action.session_id
+        );
+        let _ = swarm.dial(action.peer_id);
+    }
+}
+
+fn send_session_close(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    peer_id: PeerId,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let now_unix_ms = unix_ms();
+    let env = ControlEnvelope {
+        seq: now_unix_ms,
+        request_id: format!("close-{now_unix_ms}"),
+        message: Some(
+            aetherlink_proto::v1::control_envelope::Message::SessionClose(SessionClose {
+                session_id: session_id.to_string(),
+                reason: reason.to_string(),
+            }),
+        ),
+    };
+    let request_id = swarm
+        .behaviour_mut()
+        .control
+        .send_request(&peer_id, encode_envelope(&env));
+    app.pending_outbound_control_requests
+        .insert(request_id, OutboundControlRequestKind::SessionClose);
+    app.mark_graceful_closing(peer_id);
+    app.clear_active_session(peer_id);
+    info!("sent SessionClose peer={peer_id} session={session_id}");
+    Ok(())
+}
+
+fn send_candidate_announcement(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    peer_id: PeerId,
+    session_id: &str,
+) {
+    let now_unix_ms = unix_ms() as i64;
+    let mut all_addrs = app.known_local_addrs.clone();
+    for addr in swarm.external_addresses() {
+        if !all_addrs.iter().any(|x| x == addr) {
+            all_addrs.push(addr.clone());
+        }
+    }
+    let candidates = all_addrs
+        .into_iter()
+        .map(|addr| NetworkCandidate {
+            r#type: candidate_type_for_addr(&addr),
+            address: addr.to_string(),
+            priority: 100,
+            expires_unix_ms: (now_unix_ms + 120_000) as u64,
+            relay_peer_id: String::new(),
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    let env = ControlEnvelope {
+        seq: unix_ms(),
+        request_id: format!("cand-{}", unix_ms()),
+        message: Some(
+            aetherlink_proto::v1::control_envelope::Message::CandidateAnnouncement(
+                CandidateAnnouncement {
+                    session_id: session_id.to_string(),
+                    candidates,
+                },
+            ),
+        ),
+    };
+    let request_id = swarm
+        .behaviour_mut()
+        .control
+        .send_request(&peer_id, encode_envelope(&env));
+    app.pending_outbound_control_requests.insert(
+        request_id,
+        OutboundControlRequestKind::CandidateAnnouncement,
+    );
+}
+
+fn send_punch_sync(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    peer_id: PeerId,
+    session_id: &str,
+) {
+    let start_after_unix_ms = unix_ms() + 400;
+    let env = ControlEnvelope {
+        seq: unix_ms(),
+        request_id: format!("punch-{}", unix_ms()),
+        message: Some(aetherlink_proto::v1::control_envelope::Message::PunchSync(
+            PunchSync {
+                session_id: session_id.to_string(),
+                transaction_id: format!("tx-{}-{peer_id}", start_after_unix_ms),
+                start_after_unix_ms,
+                attempt_index: 1,
+            },
+        )),
+    };
+    let request_id = swarm
+        .behaviour_mut()
+        .control
+        .send_request(&peer_id, encode_envelope(&env));
+    app.pending_outbound_control_requests
+        .insert(request_id, OutboundControlRequestKind::PunchSync);
+}
+
+fn on_session_activated(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    peer_id: PeerId,
+    session_id: &str,
+) {
+    send_candidate_announcement(swarm, app, peer_id, session_id);
+    send_punch_sync(swarm, app, peer_id, session_id);
 }
 
 fn maybe_publish_local_device_record(
@@ -1308,6 +1540,7 @@ fn handle_control_request(
                 .send_response(channel, payload)
                 .map_err(|_| anyhow!("send control response failed: channel closed"))?;
             app.on_accept(peer, accept.session_id.clone());
+            on_session_activated(swarm, app, peer, &accept.session_id);
         }
         Some(aetherlink_proto::v1::control_envelope::Message::Ping(ping)) => {
             if let Some(active_session_id) = app.active_sessions.get(&peer)
@@ -1336,7 +1569,53 @@ fn handle_control_request(
                 .send_response(channel, encode_envelope(&response))
                 .map_err(|_| anyhow!("send Pong failed: channel closed"))?;
         }
-        _ => {}
+        Some(aetherlink_proto::v1::control_envelope::Message::SessionClose(close)) => {
+            info!(
+                "received SessionClose from peer={peer} session={} reason={}",
+                close.session_id, close.reason
+            );
+            app.mark_graceful_closing(peer);
+            app.clear_active_session(peer);
+            let _ = swarm.disconnect_peer_id(peer);
+            send_control_ack(swarm, channel, env.request_id)?;
+        }
+        Some(aetherlink_proto::v1::control_envelope::Message::CandidateAnnouncement(ann)) => {
+            info!(
+                "received CandidateAnnouncement peer={peer} session={} count={}",
+                ann.session_id,
+                ann.candidates.len()
+            );
+            for candidate in ann.candidates {
+                if candidate.address.is_empty() {
+                    continue;
+                }
+                if let Ok(addr) = candidate.address.parse::<Multiaddr>() {
+                    let dial_addr = ensure_addr_has_peer_id(addr, peer);
+                    swarm.behaviour_mut().kad.add_address(&peer, dial_addr);
+                }
+            }
+            send_control_ack(swarm, channel, env.request_id)?;
+        }
+        Some(aetherlink_proto::v1::control_envelope::Message::PunchSync(punch)) => {
+            info!(
+                "received PunchSync peer={peer} session={} tx={} start_after={} attempt={}",
+                punch.session_id,
+                punch.transaction_id,
+                punch.start_after_unix_ms,
+                punch.attempt_index
+            );
+            app.pending_punch_actions.push(PendingPunchAction {
+                peer_id: peer,
+                session_id: punch.session_id,
+                transaction_id: punch.transaction_id,
+                start_after_unix_ms: punch.start_after_unix_ms as i64,
+                attempt_index: punch.attempt_index,
+            });
+            send_control_ack(swarm, channel, env.request_id)?;
+        }
+        _ => {
+            send_control_ack(swarm, channel, env.request_id)?;
+        }
     }
     Ok(())
 }
@@ -1368,7 +1647,26 @@ fn send_session_reject(
     Ok(())
 }
 
+fn send_control_ack(
+    swarm: &mut Swarm<NodeBehaviour>,
+    channel: request_response::ResponseChannel<Vec<u8>>,
+    request_id: String,
+) -> Result<()> {
+    let response = ControlEnvelope {
+        seq: unix_ms(),
+        request_id,
+        message: None,
+    };
+    swarm
+        .behaviour_mut()
+        .control
+        .send_response(channel, encode_envelope(&response))
+        .map_err(|_| anyhow!("send control ack failed: channel closed"))?;
+    Ok(())
+}
+
 fn handle_control_response(
+    swarm: &mut Swarm<NodeBehaviour>,
     app: &mut App,
     peer: PeerId,
     request_id: request_response::OutboundRequestId,
@@ -1444,6 +1742,7 @@ fn handle_control_response(
                 accept.using_relay
             );
             app.on_accept(peer, accept.session_id.clone());
+            on_session_activated(swarm, app, peer, &accept.session_id);
         }
         Some(aetherlink_proto::v1::control_envelope::Message::SessionReject(reject)) => {
             if !matches!(
@@ -1477,6 +1776,32 @@ fn handle_control_response(
             None => {
                 warn!("received Pong without known outbound request peer={peer}");
             }
+        },
+        Some(aetherlink_proto::v1::control_envelope::Message::SessionClose(close)) => {
+            info!(
+                "received SessionClose response peer={peer} session={} reason={}",
+                close.session_id, close.reason
+            );
+            app.mark_graceful_closing(peer);
+            app.clear_active_session(peer);
+            let _ = swarm.disconnect_peer_id(peer);
+        }
+        None => match request_kind {
+            Some(OutboundControlRequestKind::SessionClose) => {
+                info!("SessionClose acknowledged by peer={peer}");
+                let _ = swarm.disconnect_peer_id(peer);
+            }
+            Some(OutboundControlRequestKind::CandidateAnnouncement) => {
+                info!("CandidateAnnouncement acknowledged by peer={peer}");
+            }
+            Some(OutboundControlRequestKind::PunchSync) => {
+                info!("PunchSync acknowledged by peer={peer}");
+            }
+            Some(OutboundControlRequestKind::SessionRequest)
+            | Some(OutboundControlRequestKind::KeepalivePing { .. }) => {
+                warn!("received empty ack for unexpected request kind from peer={peer}");
+            }
+            None => {}
         },
         _ => {}
     }
@@ -1618,6 +1943,17 @@ fn ensure_addr_has_peer_id(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
         addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
     }
     addr
+}
+
+fn candidate_type_for_addr(addr: &Multiaddr) -> i32 {
+    if addr
+        .iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip6(_)))
+    {
+        CandidateType::Ipv6Direct as i32
+    } else {
+        CandidateType::Lan as i32
+    }
 }
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {

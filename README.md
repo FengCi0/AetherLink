@@ -1,4 +1,4 @@
-# AetherLink v0.3
+# AetherLink v0.4
 
 去中心化远控的可运行基础版本（Rust）。
 
@@ -13,7 +13,7 @@
   - `crates/aetherlink-core`：连接状态机 + 安全握手核心（签名、验签、防重放、TOFU 信任）
   - `apps/aetherlink-node`：可运行 P2P 节点（QUIC + mDNS + Kademlia + 控制面消息）
 
-## 功能能力（v0.3）
+## 功能能力（v0.4）
 
 - 持久化本地设备身份（Ed25519，默认路径 `~/.config/aetherlink/device.key`）
 - QUIC 监听与拨号
@@ -22,6 +22,9 @@
 - DHT 设备公告发布（`device_code -> peer_id + addrs`）
 - 按设备码 DHT 查询并自动拨号
 - 控制协议 `SessionRequest/SessionAccept` 请求响应
+- 控制协议 `SessionClose`（会话关闭通知 + 状态收敛）
+- `CandidateAnnouncement` 交换候选地址并注入路由表
+- `PunchSync` 交换打洞时序并按计划触发拨号
 - 状态机驱动的连接状态推进（Idle -> Discovering -> ... -> Active）
 - `SessionRequest` / `SessionAccept` 双向签名与验签
 - 防重放（nonce + 时间窗）
@@ -30,6 +33,7 @@
 - 会话请求超时自动重试（可配置超时与重试次数）
 - 控制面保活 Ping/Pong（可配置间隔、超时、连续丢失阈值）
 - TOFU 信任库（默认开启）持久化到 `~/.config/aetherlink/trusted_peers.json`
+- Linux X11 + H264 + UDP 媒体面脚本化 PoC（`ffmpeg`）
 
 ## 快速开始
 
@@ -108,6 +112,22 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 ./scripts/demo_device_code_discovery.sh
 ```
 
+Linux X11 + H264 + UDP 媒体面 PoC（脚本化）：
+
+```bash
+# 终端 1：接收端
+./scripts/media_poc_x11_h264_udp.sh receiver
+
+# 终端 2：发送端（默认抓取 :0.0 的 1280x720@15）
+./scripts/media_poc_x11_h264_udp.sh sender
+```
+
+或本机快速演示（自动起 receiver + sender）：
+
+```bash
+AETHERLINK_MEDIA_DEMO_SECONDS=10 ./scripts/media_poc_x11_h264_udp.sh demo
+```
+
 ## 参数说明
 
 - `--listen <multiaddr>`：本地监听地址，默认 `/ip4/0.0.0.0/udp/9000/quic-v1`
@@ -126,6 +146,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 - `--control-keepalive-interval-ms <ms>`：控制面保活 Ping 发送间隔（默认 `1000`）
 - `--control-keepalive-timeout-ms <ms>`：控制面保活单次超时（默认 `1200`）
 - `--control-keepalive-max-misses <n>`：控制面保活连续丢失阈值，超过后断开并触发重连状态（默认 `3`）
+- `--session-auto-close-ms <ms>`：会话进入 Active 后自动发送 `SessionClose`（默认 `0`，关闭）
 
 ## 现阶段边界
 
