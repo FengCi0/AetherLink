@@ -1,4 +1,4 @@
-# AetherLink v0.2
+# AetherLink v0.3
 
 去中心化远控的可运行基础版本（Rust）。
 
@@ -13,7 +13,7 @@
   - `crates/aetherlink-core`：连接状态机 + 安全握手核心（签名、验签、防重放、TOFU 信任）
   - `apps/aetherlink-node`：可运行 P2P 节点（QUIC + mDNS + Kademlia + 控制面消息）
 
-## 功能能力（v0.2）
+## 功能能力（v0.3）
 
 - 持久化本地设备身份（Ed25519，默认路径 `~/.config/aetherlink/device.key`）
 - QUIC 监听与拨号
@@ -28,6 +28,7 @@
 - 传输层 peer id 与签名身份绑定校验
 - `SessionAccept` 与请求 nonce 绑定校验（防串会话响应）
 - 会话请求超时自动重试（可配置超时与重试次数）
+- 控制面保活 Ping/Pong（可配置间隔、超时、连续丢失阈值）
 - TOFU 信任库（默认开启）持久化到 `~/.config/aetherlink/trusted_peers.json`
 
 ## 快速开始
@@ -93,7 +94,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 
 - `published local device announcement to DHT`
 - `started DHT device lookup`
-- `device discovery hit`
+- `device discovery hit` / `device discovery resolved target=...`
 - `sent SessionRequest`
 - `session accepted`
 
@@ -122,6 +123,9 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 - `--device-lookup-interval-ms <ms>`：设备码 DHT 查询间隔（默认 `2500`）
 - `--device-record-republish-ms <ms>`：本机设备公告重发间隔（默认 `15000`）
 - `--disable-device-record-publish`：禁用本机设备公告发布
+- `--control-keepalive-interval-ms <ms>`：控制面保活 Ping 发送间隔（默认 `1000`）
+- `--control-keepalive-timeout-ms <ms>`：控制面保活单次超时（默认 `1200`）
+- `--control-keepalive-max-misses <n>`：控制面保活连续丢失阈值，超过后断开并触发重连状态（默认 `3`）
 
 ## 现阶段边界
 

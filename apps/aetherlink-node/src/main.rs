@@ -13,8 +13,8 @@ use aetherlink_core::{
     sign_session_request, verify_session_accept, verify_session_request,
 };
 use aetherlink_proto::v1::{
-    ControlEnvelope, DeviceIdentity, ProtocolVersion, RejectReason, SessionAccept, SessionReject,
-    SessionRequest, SessionRole,
+    ControlEnvelope, DeviceIdentity, Ping as ControlPing, Pong as ControlPong, ProtocolVersion,
+    RejectReason, SessionAccept, SessionReject, SessionRequest, SessionRole,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{ArgAction, Parser};
@@ -127,6 +127,27 @@ struct Args {
         help = "Disable publishing local device announcement record to DHT"
     )]
     disable_device_record_publish: bool,
+
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Control keepalive Ping send interval (milliseconds)"
+    )]
+    control_keepalive_interval_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 1200,
+        help = "Control keepalive timeout per Ping (milliseconds)"
+    )]
+    control_keepalive_timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Control keepalive max consecutive misses before disconnect"
+    )]
+    control_keepalive_max_misses: u32,
 }
 
 #[derive(NetworkBehaviour)]
@@ -233,6 +254,9 @@ async fn main() -> Result<()> {
         args.device_lookup_interval_ms,
         args.device_record_republish_ms,
         !args.disable_device_record_publish,
+        args.control_keepalive_interval_ms,
+        args.control_keepalive_timeout_ms,
+        args.control_keepalive_max_misses,
     );
 
     if !app.connect_device_codes.is_empty() {
@@ -272,6 +296,7 @@ async fn main() -> Result<()> {
             _ = tick.tick() => {
                 handle_pending_session_timeouts(&mut swarm, &mut app);
                 handle_discovery_tick(&mut swarm, &mut app);
+                handle_control_keepalive_tick(&mut swarm, &mut app);
             }
             event = swarm.select_next_some() => {
                 match event {
@@ -363,6 +388,13 @@ struct App {
     last_device_lookup_unix_ms: HashMap<String, i64>,
     last_device_record_publish_unix_ms: i64,
     last_peer_dial_unix_ms: HashMap<PeerId, i64>,
+    active_sessions: HashMap<PeerId, String>,
+    control_keepalive: HashMap<PeerId, ControlKeepaliveState>,
+    control_keepalive_interval_ms: i64,
+    control_keepalive_timeout_ms: i64,
+    control_keepalive_max_misses: u32,
+    pending_outbound_control_requests:
+        HashMap<request_response::OutboundRequestId, OutboundControlRequestKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +403,21 @@ struct PendingOutboundSession {
     request_nonces: Vec<Vec<u8>>,
     last_send_unix_ms: i64,
     attempts: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ControlKeepaliveState {
+    next_seq: u64,
+    last_send_unix_ms: i64,
+    awaiting_seq: Option<u64>,
+    awaiting_since_unix_ms: Option<i64>,
+    consecutive_misses: u32,
+}
+
+#[derive(Debug, Clone)]
+enum OutboundControlRequestKind {
+    SessionRequest,
+    KeepalivePing { seq: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +443,9 @@ impl App {
         device_lookup_interval_ms: u64,
         device_record_republish_ms: u64,
         publish_device_record: bool,
+        control_keepalive_interval_ms: u64,
+        control_keepalive_timeout_ms: u64,
+        control_keepalive_max_misses: u32,
     ) -> Self {
         let mut connect_device_codes = connect_device_codes
             .into_iter()
@@ -429,6 +479,12 @@ impl App {
             last_device_lookup_unix_ms: HashMap::new(),
             last_device_record_publish_unix_ms: 0,
             last_peer_dial_unix_ms: HashMap::new(),
+            active_sessions: HashMap::new(),
+            control_keepalive: HashMap::new(),
+            control_keepalive_interval_ms: control_keepalive_interval_ms.max(300) as i64,
+            control_keepalive_timeout_ms: control_keepalive_timeout_ms.max(500) as i64,
+            control_keepalive_max_misses: control_keepalive_max_misses.max(1),
+            pending_outbound_control_requests: HashMap::new(),
         }
     }
 
@@ -469,6 +525,111 @@ impl App {
         true
     }
 
+    fn set_active_session(&mut self, peer_id: PeerId, session_id: String) {
+        self.active_sessions.insert(peer_id, session_id);
+        self.control_keepalive.entry(peer_id).or_default();
+    }
+
+    fn clear_active_session(&mut self, peer_id: PeerId) {
+        self.active_sessions.remove(&peer_id);
+        self.control_keepalive.remove(&peer_id);
+    }
+
+    fn note_control_pong(&mut self, peer_id: PeerId, pong: &ControlPong) -> Option<i64> {
+        let Some(active_session_id) = self.active_sessions.get(&peer_id) else {
+            return None;
+        };
+        if active_session_id != &pong.session_id {
+            warn!(
+                "ignore Pong with mismatched session id from peer={peer_id}: expected={}, got={}",
+                active_session_id, pong.session_id
+            );
+            return None;
+        }
+        let Some(state) = self.control_keepalive.get_mut(&peer_id) else {
+            return None;
+        };
+        if let Some(expected_seq) = state.awaiting_seq
+            && expected_seq != pong.seq
+        {
+            warn!(
+                "ignore Pong with mismatched seq from peer={peer_id}: expected={}, got={}",
+                expected_seq, pong.seq
+            );
+            return None;
+        }
+        state.awaiting_seq = None;
+        state.awaiting_since_unix_ms = None;
+        state.consecutive_misses = 0;
+        Some((unix_ms() as i64).saturating_sub(pong.echo_send_unix_ms as i64))
+    }
+
+    fn note_keepalive_send_failure(&mut self, peer_id: PeerId, seq: u64) -> bool {
+        let Some(state) = self.control_keepalive.get_mut(&peer_id) else {
+            return false;
+        };
+        if state.awaiting_seq != Some(seq) {
+            return false;
+        }
+        state.awaiting_seq = None;
+        state.awaiting_since_unix_ms = None;
+        state.consecutive_misses = state.consecutive_misses.saturating_add(1);
+        state.consecutive_misses >= self.control_keepalive_max_misses
+    }
+
+    fn collect_keepalive_actions(
+        &mut self,
+        now_unix_ms: i64,
+        connected_peers: &HashSet<PeerId>,
+    ) -> (Vec<(PeerId, String, u64)>, Vec<PeerId>) {
+        let mut send_actions = Vec::new();
+        let mut lost_peers = Vec::new();
+        let active = self
+            .active_sessions
+            .iter()
+            .map(|(peer, session_id)| (*peer, session_id.clone()))
+            .collect::<Vec<_>>();
+
+        for (peer_id, session_id) in active {
+            if !connected_peers.contains(&peer_id) {
+                continue;
+            }
+            let state = self.control_keepalive.entry(peer_id).or_default();
+
+            if let Some(awaiting_since) = state.awaiting_since_unix_ms {
+                if now_unix_ms.saturating_sub(awaiting_since) >= self.control_keepalive_timeout_ms {
+                    state.awaiting_since_unix_ms = None;
+                    state.awaiting_seq = None;
+                    state.consecutive_misses = state.consecutive_misses.saturating_add(1);
+                    warn!(
+                        "control keepalive timeout peer={peer_id} misses={}",
+                        state.consecutive_misses
+                    );
+                    if state.consecutive_misses >= self.control_keepalive_max_misses {
+                        lost_peers.push(peer_id);
+                    }
+                } else {
+                    continue;
+                }
+            }
+
+            if now_unix_ms.saturating_sub(state.last_send_unix_ms)
+                < self.control_keepalive_interval_ms
+            {
+                continue;
+            }
+
+            state.next_seq = state.next_seq.saturating_add(1);
+            let seq = state.next_seq;
+            state.last_send_unix_ms = now_unix_ms;
+            state.awaiting_seq = Some(seq);
+            state.awaiting_since_unix_ms = Some(now_unix_ms);
+            send_actions.push((peer_id, session_id, seq));
+        }
+
+        (send_actions, lost_peers)
+    }
+
     fn can_attempt_discovery_dial(&self, swarm: &Swarm<NodeBehaviour>, peer_id: PeerId) -> bool {
         if swarm.is_connected(&peer_id) {
             return false;
@@ -498,12 +659,14 @@ impl App {
 
     fn on_disconnected(&mut self, peer_id: PeerId) {
         self.pending_outbound_sessions.remove(&peer_id);
+        self.clear_active_session(peer_id);
         if let Some(sm) = self.sessions.get_mut(&peer_id) {
             let _ = sm.apply(Trigger::PathLost);
         }
     }
 
-    fn on_accept(&mut self, peer_id: PeerId) {
+    fn on_accept(&mut self, peer_id: PeerId, session_id: String) {
+        self.set_active_session(peer_id, session_id);
         if let Some(sm) = self.sessions.get_mut(&peer_id) {
             let _ = sm.apply(Trigger::HandshakeOk);
         }
@@ -586,8 +749,11 @@ async fn handle_behaviour_event(
             } => {
                 handle_control_request(swarm, app, peer, request, channel)?;
             }
-            request_response::Message::Response { response, .. } => {
-                handle_control_response(app, peer, response)?;
+            request_response::Message::Response {
+                request_id,
+                response,
+            } => {
+                handle_control_response(app, peer, request_id, response)?;
             }
         },
         NodeEvent::Control(request_response::Event::OutboundFailure {
@@ -597,8 +763,24 @@ async fn handle_behaviour_event(
             ..
         }) => {
             warn!("control outbound failure peer={peer} req={request_id:?} err={error}");
-            app.pending_outbound_sessions.remove(&peer);
-            app.on_auth_failed(peer);
+            match app.pending_outbound_control_requests.remove(&request_id) {
+                Some(OutboundControlRequestKind::SessionRequest) => {
+                    app.pending_outbound_sessions.remove(&peer);
+                    app.on_auth_failed(peer);
+                }
+                Some(OutboundControlRequestKind::KeepalivePing { seq }) => {
+                    if app.note_keepalive_send_failure(peer, seq) {
+                        app.clear_active_session(peer);
+                        warn!(
+                            "keepalive send failures exceeded threshold peer={peer}, disconnecting"
+                        );
+                        let _ = swarm.disconnect_peer_id(peer);
+                    }
+                }
+                None => {
+                    warn!("unknown outbound control request failed req={request_id:?}");
+                }
+            }
         }
         NodeEvent::Control(request_response::Event::InboundFailure {
             peer,
@@ -653,6 +835,8 @@ fn send_session_request(
         .behaviour_mut()
         .control
         .send_request(&peer_id, encode_envelope(&env));
+    app.pending_outbound_control_requests
+        .insert(request_id, OutboundControlRequestKind::SessionRequest);
 
     let pending = app
         .pending_outbound_sessions
@@ -734,6 +918,54 @@ fn handle_discovery_tick(swarm: &mut Swarm<NodeBehaviour>, app: &mut App) {
         warn!("publish local device announcement failed: {err}");
     }
     maybe_start_device_code_lookups(swarm, app);
+}
+
+fn handle_control_keepalive_tick(swarm: &mut Swarm<NodeBehaviour>, app: &mut App) {
+    let now_unix_ms = unix_ms() as i64;
+    let connected_peers = swarm.connected_peers().copied().collect::<HashSet<_>>();
+    let (send_actions, lost_peers) = app.collect_keepalive_actions(now_unix_ms, &connected_peers);
+
+    for (peer_id, session_id, seq) in send_actions {
+        if let Err(err) = send_control_ping(swarm, app, peer_id, &session_id, seq) {
+            warn!("send keepalive ping failed peer={peer_id} seq={seq}: {err}");
+        }
+    }
+
+    for peer_id in lost_peers {
+        app.clear_active_session(peer_id);
+        warn!("control keepalive lost peer={peer_id}, disconnecting");
+        let _ = swarm.disconnect_peer_id(peer_id);
+    }
+}
+
+fn send_control_ping(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    peer_id: PeerId,
+    session_id: &str,
+    seq: u64,
+) -> Result<()> {
+    let now_unix_ms = unix_ms();
+    let env = ControlEnvelope {
+        seq,
+        request_id: format!("ping-{now_unix_ms}-{seq}"),
+        message: Some(aetherlink_proto::v1::control_envelope::Message::Ping(
+            ControlPing {
+                session_id: session_id.to_string(),
+                seq,
+                send_unix_ms: now_unix_ms,
+            },
+        )),
+    };
+    let request_id = swarm
+        .behaviour_mut()
+        .control
+        .send_request(&peer_id, encode_envelope(&env));
+    app.pending_outbound_control_requests.insert(
+        request_id,
+        OutboundControlRequestKind::KeepalivePing { seq },
+    );
+    Ok(())
 }
 
 fn maybe_publish_local_device_record(
@@ -985,95 +1217,126 @@ fn handle_control_request(
     channel: request_response::ResponseChannel<Vec<u8>>,
 ) -> Result<()> {
     let env = decode_envelope(&request)?;
-    if let Some(aetherlink_proto::v1::control_envelope::Message::SessionRequest(req)) = env.message
-    {
-        info!(
-            "received SessionRequest from={peer} target={}",
-            req.target_device_code
-        );
-
-        if req.version.as_ref().map(|v| v.major).unwrap_or_default() != PROTOCOL_MAJOR {
-            return send_session_reject(
-                swarm,
-                channel,
-                env.request_id,
-                req.session_id,
-                RejectReason::VersionMismatch,
-                format!(
-                    "protocol major mismatch: expected {}, got {:?}",
-                    PROTOCOL_MAJOR,
-                    req.version.map(|v| v.major)
-                ),
+    match env.message {
+        Some(aetherlink_proto::v1::control_envelope::Message::SessionRequest(req)) => {
+            info!(
+                "received SessionRequest from={peer} target={}",
+                req.target_device_code
             );
-        }
 
-        let verify_result = verify_session_request(
-            &req,
-            Some(&peer),
-            Some(&app.local_device_code),
-            unix_ms() as i64,
-            DEFAULT_ALLOWED_SKEW_MS,
-            &mut app.nonce_cache,
-            &mut app.trusted_peers,
-            app.trust_on_first_use,
-        );
-        let verified = match verify_result {
-            Ok(v) => v,
-            Err(err) => {
-                app.on_auth_failed(peer);
+            if req.version.as_ref().map(|v| v.major).unwrap_or_default() != PROTOCOL_MAJOR {
                 return send_session_reject(
                     swarm,
                     channel,
                     env.request_id,
                     req.session_id,
-                    map_auth_error_to_reject(&err),
-                    err.to_string(),
+                    RejectReason::VersionMismatch,
+                    format!(
+                        "protocol major mismatch: expected {}, got {:?}",
+                        PROTOCOL_MAJOR,
+                        req.version.map(|v| v.major)
+                    ),
                 );
             }
-        };
 
-        if verified.trust_store_changed {
-            if let Err(err) = app.persist_trust_store() {
-                warn!("failed to persist trust store: {err}");
-            } else {
-                info!(
-                    "trust store updated for device_code={}",
-                    verified.device_code
-                );
+            let verify_result = verify_session_request(
+                &req,
+                Some(&peer),
+                Some(&app.local_device_code),
+                unix_ms() as i64,
+                DEFAULT_ALLOWED_SKEW_MS,
+                &mut app.nonce_cache,
+                &mut app.trusted_peers,
+                app.trust_on_first_use,
+            );
+            let verified = match verify_result {
+                Ok(v) => v,
+                Err(err) => {
+                    app.on_auth_failed(peer);
+                    return send_session_reject(
+                        swarm,
+                        channel,
+                        env.request_id,
+                        req.session_id,
+                        map_auth_error_to_reject(&err),
+                        err.to_string(),
+                    );
+                }
+            };
+
+            if verified.trust_store_changed {
+                if let Err(err) = app.persist_trust_store() {
+                    warn!("failed to persist trust store: {err}");
+                } else {
+                    info!(
+                        "trust store updated for device_code={}",
+                        verified.device_code
+                    );
+                }
             }
+
+            let mut accept = SessionAccept {
+                session_id: req.session_id,
+                selected_codec: aetherlink_proto::v1::VideoCodec::H264 as i32,
+                selected_fps: 30,
+                selected_width: 1280,
+                selected_height: 720,
+                using_relay: false,
+                path_id: "direct-quic".to_string(),
+                from: Some(DeviceIdentity {
+                    peer_id: app.local_peer_id.to_bytes(),
+                    identity_pubkey: app.local_key.public().encode_protobuf(),
+                    device_code: app.local_device_code.clone(),
+                }),
+                nonce: random_nonce(16),
+                unix_ms: unix_ms() as i64,
+                signature: Vec::new(),
+                request_nonce: req.nonce.clone(),
+            };
+            sign_session_accept(&mut accept, &app.local_key).context("sign SessionAccept")?;
+            let response = ControlEnvelope {
+                seq: unix_ms(),
+                request_id: env.request_id,
+                message: Some(
+                    aetherlink_proto::v1::control_envelope::Message::SessionAccept(accept.clone()),
+                ),
+            };
+            let payload = encode_envelope(&response);
+            swarm
+                .behaviour_mut()
+                .control
+                .send_response(channel, payload)
+                .map_err(|_| anyhow!("send control response failed: channel closed"))?;
+            app.on_accept(peer, accept.session_id.clone());
         }
-
-        let mut accept = SessionAccept {
-            session_id: req.session_id,
-            selected_codec: aetherlink_proto::v1::VideoCodec::H264 as i32,
-            selected_fps: 30,
-            selected_width: 1280,
-            selected_height: 720,
-            using_relay: false,
-            path_id: "direct-quic".to_string(),
-            from: Some(DeviceIdentity {
-                peer_id: app.local_peer_id.to_bytes(),
-                identity_pubkey: app.local_key.public().encode_protobuf(),
-                device_code: app.local_device_code.clone(),
-            }),
-            nonce: random_nonce(16),
-            unix_ms: unix_ms() as i64,
-            signature: Vec::new(),
-            request_nonce: req.nonce.clone(),
-        };
-        sign_session_accept(&mut accept, &app.local_key).context("sign SessionAccept")?;
-        let response = ControlEnvelope {
-            seq: unix_ms(),
-            request_id: env.request_id,
-            message: Some(aetherlink_proto::v1::control_envelope::Message::SessionAccept(accept)),
-        };
-        let payload = encode_envelope(&response);
-        swarm
-            .behaviour_mut()
-            .control
-            .send_response(channel, payload)
-            .map_err(|_| anyhow!("send control response failed: channel closed"))?;
-        app.on_accept(peer);
+        Some(aetherlink_proto::v1::control_envelope::Message::Ping(ping)) => {
+            if let Some(active_session_id) = app.active_sessions.get(&peer)
+                && active_session_id != &ping.session_id
+            {
+                warn!(
+                    "received keepalive Ping with mismatched session id from peer={peer}: expected={}, got={}",
+                    active_session_id, ping.session_id
+                );
+            }
+            let response = ControlEnvelope {
+                seq: unix_ms(),
+                request_id: env.request_id,
+                message: Some(aetherlink_proto::v1::control_envelope::Message::Pong(
+                    ControlPong {
+                        session_id: ping.session_id,
+                        seq: ping.seq,
+                        echo_send_unix_ms: ping.send_unix_ms,
+                        recv_unix_ms: unix_ms(),
+                    },
+                )),
+            };
+            swarm
+                .behaviour_mut()
+                .control
+                .send_response(channel, encode_envelope(&response))
+                .map_err(|_| anyhow!("send Pong failed: channel closed"))?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1105,10 +1368,22 @@ fn send_session_reject(
     Ok(())
 }
 
-fn handle_control_response(app: &mut App, peer: PeerId, response: Vec<u8>) -> Result<()> {
+fn handle_control_response(
+    app: &mut App,
+    peer: PeerId,
+    request_id: request_response::OutboundRequestId,
+    response: Vec<u8>,
+) -> Result<()> {
+    let request_kind = app.pending_outbound_control_requests.remove(&request_id);
     let env = decode_envelope(&response)?;
     match env.message {
         Some(aetherlink_proto::v1::control_envelope::Message::SessionAccept(accept)) => {
+            if !matches!(
+                request_kind,
+                Some(OutboundControlRequestKind::SessionRequest)
+            ) {
+                warn!("unexpected SessionAccept for request kind: {request_kind:?}");
+            }
             let Some(pending) = app.pending_outbound_sessions.remove(&peer) else {
                 warn!("received SessionAccept from {peer} without pending outbound session");
                 app.on_auth_failed(peer);
@@ -1168,9 +1443,15 @@ fn handle_control_response(app: &mut App, peer: PeerId, response: Vec<u8>) -> Re
                 accept.selected_fps,
                 accept.using_relay
             );
-            app.on_accept(peer);
+            app.on_accept(peer, accept.session_id.clone());
         }
         Some(aetherlink_proto::v1::control_envelope::Message::SessionReject(reject)) => {
+            if !matches!(
+                request_kind,
+                Some(OutboundControlRequestKind::SessionRequest)
+            ) {
+                warn!("unexpected SessionReject for request kind: {request_kind:?}");
+            }
             app.pending_outbound_sessions.remove(&peer);
             let reason = RejectReason::try_from(reject.reason)
                 .map(|x| x.as_str_name().to_string())
@@ -1181,6 +1462,22 @@ fn handle_control_response(app: &mut App, peer: PeerId, response: Vec<u8>) -> Re
             );
             app.on_auth_failed(peer);
         }
+        Some(aetherlink_proto::v1::control_envelope::Message::Pong(pong)) => match request_kind {
+            Some(OutboundControlRequestKind::KeepalivePing { seq }) if seq == pong.seq => {
+                if let Some(rtt_ms) = app.note_control_pong(peer, &pong) {
+                    info!(
+                        "control keepalive pong peer={peer} seq={} rtt_ms={rtt_ms}",
+                        pong.seq
+                    );
+                }
+            }
+            Some(kind) => {
+                warn!("unexpected Pong for request kind={kind:?} peer={peer}");
+            }
+            None => {
+                warn!("received Pong without known outbound request peer={peer}");
+            }
+        },
         _ => {}
     }
     Ok(())
