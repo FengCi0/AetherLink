@@ -1,0 +1,229 @@
+syntax = "proto3";
+
+package aetherlink.v1;
+
+option java_multiple_files = true;
+option java_package = "com.aetherlink.v1";
+
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+message DeviceIdentity {
+  bytes peer_id = 1;
+  bytes identity_pubkey = 2;
+  string device_code = 3;
+}
+
+enum SessionRole {
+  SESSION_ROLE_UNSPECIFIED = 0;
+  SESSION_ROLE_CONTROLLER = 1;
+  SESSION_ROLE_TARGET = 2;
+}
+
+enum VideoCodec {
+  VIDEO_CODEC_UNSPECIFIED = 0;
+  VIDEO_CODEC_H264 = 1;
+  VIDEO_CODEC_H265 = 2;
+  VIDEO_CODEC_VP9 = 3;
+  VIDEO_CODEC_AV1 = 4;
+}
+
+enum CandidateType {
+  CANDIDATE_TYPE_UNSPECIFIED = 0;
+  CANDIDATE_TYPE_LAN = 1;
+  CANDIDATE_TYPE_IPV6_DIRECT = 2;
+  CANDIDATE_TYPE_SERVER_REFLEXIVE = 3;
+  CANDIDATE_TYPE_RELAY = 4;
+  CANDIDATE_TYPE_MANUAL = 5;
+}
+
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  REJECT_REASON_BUSY = 1;
+  REJECT_REASON_AUTH_FAILED = 2;
+  REJECT_REASON_VERSION_MISMATCH = 3;
+  REJECT_REASON_POLICY_DENIED = 4;
+  REJECT_REASON_TIMEOUT = 5;
+}
+
+enum InputSource {
+  INPUT_SOURCE_UNSPECIFIED = 0;
+  INPUT_SOURCE_MOUSE = 1;
+  INPUT_SOURCE_KEYBOARD = 2;
+  INPUT_SOURCE_TOUCH = 3;
+}
+
+message NetworkCandidate {
+  CandidateType type = 1;
+  string address = 2;
+  uint32 priority = 3;
+  uint64 expires_unix_ms = 4;
+  string relay_peer_id = 5;
+}
+
+message SessionRequest {
+  string session_id = 1;
+  DeviceIdentity from = 2;
+  SessionRole requested_role = 3;
+  string target_device_code = 4;
+  repeated VideoCodec supported_video_codecs = 5;
+  bool allow_relay = 6;
+  uint32 preferred_max_fps = 7;
+  uint32 preferred_max_width = 8;
+  uint32 preferred_max_height = 9;
+  bytes nonce = 10;
+  int64 unix_ms = 11;
+  bytes signature = 12;
+  ProtocolVersion version = 13;
+}
+
+message SessionAccept {
+  string session_id = 1;
+  VideoCodec selected_codec = 2;
+  uint32 selected_fps = 3;
+  uint32 selected_width = 4;
+  uint32 selected_height = 5;
+  bool using_relay = 6;
+  string path_id = 7;
+}
+
+message SessionReject {
+  string session_id = 1;
+  RejectReason reason = 2;
+  string detail = 3;
+}
+
+message SessionClose {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message CandidateAnnouncement {
+  string session_id = 1;
+  repeated NetworkCandidate candidates = 2;
+}
+
+message PunchSync {
+  string session_id = 1;
+  string transaction_id = 2;
+  uint64 start_after_unix_ms = 3;
+  uint32 attempt_index = 4;
+}
+
+message Ping {
+  string session_id = 1;
+  uint64 seq = 2;
+  uint64 send_unix_ms = 3;
+}
+
+message Pong {
+  string session_id = 1;
+  uint64 seq = 2;
+  uint64 echo_send_unix_ms = 3;
+  uint64 recv_unix_ms = 4;
+}
+
+message VideoConfigUpdate {
+  string session_id = 1;
+  VideoCodec codec = 2;
+  uint32 max_fps = 3;
+  uint32 max_width = 4;
+  uint32 max_height = 5;
+  uint32 target_bitrate_kbps = 6;
+  bool keyframe_request = 7;
+}
+
+message MouseEvent {
+  int32 x = 1;
+  int32 y = 2;
+  sint32 delta_x = 3;
+  sint32 delta_y = 4;
+  uint32 buttons_mask = 5;
+  bool down = 6;
+  bool up = 7;
+}
+
+message WheelEvent {
+  sint32 delta_x = 1;
+  sint32 delta_y = 2;
+}
+
+message KeyEvent {
+  uint32 key_code = 1;
+  bool down = 2;
+  bool up = 3;
+  bool repeat = 4;
+  uint32 modifiers_mask = 5;
+}
+
+message TouchEvent {
+  uint32 pointer_id = 1;
+  float x = 2;
+  float y = 3;
+  bool down = 4;
+  bool move = 5;
+  bool up = 6;
+}
+
+message InputEvent {
+  string session_id = 1;
+  InputSource source = 2;
+  uint64 event_unix_ms = 3;
+  oneof payload {
+    MouseEvent mouse = 10;
+    WheelEvent wheel = 11;
+    KeyEvent key = 12;
+    TouchEvent touch = 13;
+  }
+}
+
+message StatsReport {
+  string session_id = 1;
+  uint32 rtt_ms = 2;
+  uint32 tx_bitrate_kbps = 3;
+  uint32 rx_bitrate_kbps = 4;
+  uint32 packet_loss_x10000 = 5;
+  uint32 encode_latency_ms = 6;
+  uint32 decode_latency_ms = 7;
+  bool using_relay = 8;
+}
+
+message ErrorFrame {
+  string session_id = 1;
+  uint32 code = 2;
+  string message = 3;
+  bool retryable = 4;
+}
+
+message VideoChunk {
+  string session_id = 1;
+  uint64 stream_seq = 2;
+  uint64 frame_id = 3;
+  uint32 chunk_id = 4;
+  uint32 chunk_count = 5;
+  uint64 pts_us = 6;
+  bool keyframe = 7;
+  bytes payload = 8;
+}
+
+message ControlEnvelope {
+  uint64 seq = 1;
+  string request_id = 2;
+  oneof message {
+    SessionRequest session_request = 10;
+    SessionAccept session_accept = 11;
+    SessionReject session_reject = 12;
+    SessionClose session_close = 13;
+    CandidateAnnouncement candidate_announcement = 14;
+    PunchSync punch_sync = 15;
+    Ping ping = 16;
+    Pong pong = 17;
+    VideoConfigUpdate video_config_update = 18;
+    InputEvent input_event = 19;
+    StatsReport stats_report = 20;
+    ErrorFrame error = 21;
+  }
+}
