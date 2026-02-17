@@ -5,8 +5,8 @@ use thiserror::Error;
 pub mod security;
 pub use security::{
     DEFAULT_ALLOWED_SKEW_MS, DEFAULT_REPLAY_RETENTION_MS, MIN_NONCE_BYTES, NonceReplayCache,
-    SessionAuthError, TrustedPeerRecord, TrustedPeers, VerifiedSessionPeer, sign_session_request,
-    verify_session_request,
+    SessionAuthError, TrustedPeerRecord, TrustedPeers, VerifiedSessionPeer, sign_session_accept,
+    sign_session_request, verify_session_accept, verify_session_request,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

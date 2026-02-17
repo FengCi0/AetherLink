@@ -9,7 +9,8 @@ use std::{
 
 use aetherlink_core::{
     ConnectionStateMachine, DEFAULT_ALLOWED_SKEW_MS, NonceReplayCache, SessionAuthError, Trigger,
-    TrustedPeerRecord, TrustedPeers, sign_session_request, verify_session_request,
+    TrustedPeerRecord, TrustedPeers, sign_session_accept, sign_session_request,
+    verify_session_accept, verify_session_request,
 };
 use aetherlink_proto::v1::{
     ControlEnvelope, DeviceIdentity, ProtocolVersion, RejectReason, SessionAccept, SessionReject,
@@ -199,7 +200,7 @@ async fn main() -> Result<()> {
                 info!("connection established with {peer_id} via {endpoint:?}");
                 app.on_connected(peer_id);
                 if app.auto_request {
-                    if let Err(err) = send_session_request(&mut swarm, &app, peer_id) {
+                    if let Err(err) = send_session_request(&mut swarm, &mut app, peer_id) {
                         warn!("failed to send SessionRequest to {peer_id}: {err}");
                     }
                 }
@@ -258,10 +259,17 @@ struct App {
     local_device_code: String,
     auto_request: bool,
     sessions: HashMap<PeerId, ConnectionStateMachine>,
+    pending_outbound_sessions: HashMap<PeerId, PendingOutboundSession>,
     nonce_cache: NonceReplayCache,
     trusted_peers: TrustedPeers,
     trust_store_path: PathBuf,
     trust_on_first_use: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOutboundSession {
+    session_id: String,
+    request_nonce: Vec<u8>,
 }
 
 impl App {
@@ -279,6 +287,7 @@ impl App {
             local_device_code: local_peer_id.to_string(),
             auto_request,
             sessions: HashMap::new(),
+            pending_outbound_sessions: HashMap::new(),
             nonce_cache: NonceReplayCache::default(),
             trusted_peers,
             trust_store_path,
@@ -294,6 +303,7 @@ impl App {
     }
 
     fn on_disconnected(&mut self, peer_id: PeerId) {
+        self.pending_outbound_sessions.remove(&peer_id);
         if let Some(sm) = self.sessions.get_mut(&peer_id) {
             let _ = sm.apply(Trigger::PathLost);
         }
@@ -369,6 +379,7 @@ async fn handle_behaviour_event(
             ..
         }) => {
             warn!("control outbound failure peer={peer} req={request_id:?} err={error}");
+            app.pending_outbound_sessions.remove(&peer);
             app.on_auth_failed(peer);
         }
         NodeEvent::Control(request_response::Event::InboundFailure {
@@ -397,11 +408,13 @@ async fn handle_behaviour_event(
 
 fn send_session_request(
     swarm: &mut Swarm<NodeBehaviour>,
-    app: &App,
+    app: &mut App,
     peer_id: PeerId,
 ) -> Result<()> {
+    let session_id = format!("session-{}", unix_ms());
+    let request_nonce = random_nonce(16);
     let mut req = SessionRequest {
-        session_id: format!("session-{}", unix_ms()),
+        session_id: session_id.clone(),
         from: Some(DeviceIdentity {
             peer_id: app.local_peer_id.to_bytes(),
             identity_pubkey: app.local_key.public().encode_protobuf(),
@@ -414,7 +427,7 @@ fn send_session_request(
         preferred_max_fps: 30,
         preferred_max_width: 1280,
         preferred_max_height: 720,
-        nonce: random_nonce(16),
+        nonce: request_nonce.clone(),
         unix_ms: unix_ms() as i64,
         signature: Vec::new(),
         version: Some(ProtocolVersion {
@@ -435,6 +448,13 @@ fn send_session_request(
         .behaviour_mut()
         .control
         .send_request(&peer_id, payload);
+    app.pending_outbound_sessions.insert(
+        peer_id,
+        PendingOutboundSession {
+            session_id,
+            request_nonce,
+        },
+    );
     info!("sent SessionRequest to peer={peer_id}, req={request_id:?}");
     Ok(())
 }
@@ -505,7 +525,7 @@ fn handle_control_request(
             }
         }
 
-        let accept = SessionAccept {
+        let mut accept = SessionAccept {
             session_id: req.session_id,
             selected_codec: aetherlink_proto::v1::VideoCodec::H264 as i32,
             selected_fps: 30,
@@ -513,7 +533,17 @@ fn handle_control_request(
             selected_height: 720,
             using_relay: false,
             path_id: "direct-quic".to_string(),
+            from: Some(DeviceIdentity {
+                peer_id: app.local_peer_id.to_bytes(),
+                identity_pubkey: app.local_key.public().encode_protobuf(),
+                device_code: app.local_device_code.clone(),
+            }),
+            nonce: random_nonce(16),
+            unix_ms: unix_ms() as i64,
+            signature: Vec::new(),
+            request_nonce: req.nonce.clone(),
         };
+        sign_session_accept(&mut accept, &app.local_key).context("sign SessionAccept")?;
         let response = ControlEnvelope {
             seq: unix_ms(),
             request_id: env.request_id,
@@ -561,6 +591,42 @@ fn handle_control_response(app: &mut App, peer: PeerId, response: Vec<u8>) -> Re
     let env = decode_envelope(&response)?;
     match env.message {
         Some(aetherlink_proto::v1::control_envelope::Message::SessionAccept(accept)) => {
+            let Some(pending) = app.pending_outbound_sessions.remove(&peer) else {
+                warn!("received SessionAccept from {peer} without pending outbound session");
+                app.on_auth_failed(peer);
+                return Ok(());
+            };
+
+            let verified = match verify_session_accept(
+                &accept,
+                Some(&peer),
+                Some(&pending.session_id),
+                Some(&pending.request_nonce),
+                unix_ms() as i64,
+                DEFAULT_ALLOWED_SKEW_MS,
+                &mut app.nonce_cache,
+                &mut app.trusted_peers,
+                app.trust_on_first_use,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    warn!("invalid SessionAccept from {peer}: {err}");
+                    app.on_auth_failed(peer);
+                    return Ok(());
+                }
+            };
+
+            if verified.trust_store_changed {
+                if let Err(err) = app.persist_trust_store() {
+                    warn!("failed to persist trust store: {err}");
+                } else {
+                    info!(
+                        "trust store updated for device_code={}",
+                        verified.device_code
+                    );
+                }
+            }
+
             info!(
                 "session accepted by {peer}: codec={}, {}x{}@{} relay={}",
                 accept.selected_codec,
@@ -572,6 +638,7 @@ fn handle_control_response(app: &mut App, peer: PeerId, response: Vec<u8>) -> Re
             app.on_accept(peer);
         }
         Some(aetherlink_proto::v1::control_envelope::Message::SessionReject(reject)) => {
+            app.pending_outbound_sessions.remove(&peer);
             let reason = RejectReason::try_from(reject.reason)
                 .map(|x| x.as_str_name().to_string())
                 .unwrap_or_else(|_| format!("UNKNOWN({})", reject.reason));
@@ -698,11 +765,15 @@ fn map_auth_error_to_reject(err: &SessionAuthError) -> RejectReason {
         | SessionAuthError::PeerIdMismatch
         | SessionAuthError::TransportPeerIdMismatch
         | SessionAuthError::InvalidSignature
+        | SessionAuthError::MissingResponderIdentity
         | SessionAuthError::MissingSenderIdentity
         | SessionAuthError::MissingDeviceCode
         | SessionAuthError::MissingNonce
         | SessionAuthError::NonceTooShort { .. }
         | SessionAuthError::SigningFailed
+        | SessionAuthError::SessionIdMismatch { .. }
+        | SessionAuthError::MissingRequestNonceBinding
+        | SessionAuthError::RequestNonceMismatch
         | SessionAuthError::TrustStoreCorrupt(_) => RejectReason::AuthFailed,
     }
 }

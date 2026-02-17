@@ -183,14 +183,19 @@ Core message groups:
 - random nonce (>= 96 bits entropy),
 - sender timestamp (unix ms),
 - signature over canonical payload.
-2. Receiver verifies:
+2. Session accept must include:
+- responder identity,
+- response nonce + timestamp,
+- responder signature over canonical payload,
+- echoed `request_nonce` binding to the originating request.
+3. Receiver verifies:
 - timestamp within allowed window (`+-30s`),
 - nonce not seen before in replay cache (`60s` retention),
 - signature and trusted key policy.
-3. Session keys:
+4. Session keys:
 - derived during transport/auth handshake.
 - rotate on reconnect or every 10 minutes.
-4. Relay confidentiality:
+5. Relay confidentiality:
 - payload remains end-to-end encrypted at app layer.
 
 ## 11. Video Data Plane Rules

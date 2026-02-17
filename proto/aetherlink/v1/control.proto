@@ -88,6 +88,11 @@ message SessionAccept {
   uint32 selected_height = 5;
   bool using_relay = 6;
   string path_id = 7;
+  DeviceIdentity from = 8;
+  bytes nonce = 9;
+  int64 unix_ms = 10;
+  bytes signature = 11;
+  bytes request_nonce = 12;
 }
 
 message SessionReject {

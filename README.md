@@ -21,9 +21,10 @@
 - Kademlia 路由更新
 - 控制协议 `SessionRequest/SessionAccept` 请求响应
 - 状态机驱动的连接状态推进（Idle -> Discovering -> ... -> Active）
-- `SessionRequest` 签名与验签
+- `SessionRequest` / `SessionAccept` 双向签名与验签
 - 防重放（nonce + 时间窗）
 - 传输层 peer id 与签名身份绑定校验
+- `SessionAccept` 与请求 nonce 绑定校验（防串会话响应）
 - TOFU 信任库（默认开启）持久化到 `~/.config/aetherlink/trusted_peers.json`
 
 ## 快速开始
@@ -95,7 +96,6 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 - Flutter GUI 与 FRB 桥接
 - Relay/DCUtR/AutoNAT 实链路策略
 - 人工配对确认 UI（当前是 TOFU）
-- `SessionAccept` 的签名认证（当前仅请求侧强校验）
 - 媒体面加密密钥轮换与流控策略
 
 ## 测试

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use aetherlink_proto::v1::SessionRequest;
+use aetherlink_proto::v1::{SessionAccept, SessionRequest};
 use libp2p::{PeerId, identity};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,8 @@ impl NonceReplayCache {
 pub enum SessionAuthError {
     #[error("missing sender identity in SessionRequest.from")]
     MissingSenderIdentity,
+    #[error("missing responder identity in SessionAccept.from")]
+    MissingResponderIdentity,
     #[error("missing device_code in sender identity")]
     MissingDeviceCode,
     #[error("missing nonce")]
@@ -184,10 +186,16 @@ pub enum SessionAuthError {
     PeerIdMismatch,
     #[error("transport peer id does not match signed identity")]
     TransportPeerIdMismatch,
-    #[error("invalid session request signature")]
+    #[error("invalid signed message signature")]
     InvalidSignature,
-    #[error("signing session request failed")]
+    #[error("signing message failed")]
     SigningFailed,
+    #[error("unexpected session id in response: expected {expected}, got {got}")]
+    SessionIdMismatch { expected: String, got: String },
+    #[error("missing request nonce binding in SessionAccept")]
+    MissingRequestNonceBinding,
+    #[error("response request nonce does not match request nonce")]
+    RequestNonceMismatch,
     #[error("peer is not trusted and trust-on-first-use is disabled: {device_code}")]
     UntrustedPeer { device_code: String },
     #[error("trusted peer mismatch for device code {device_code}")]
@@ -203,6 +211,18 @@ pub fn sign_session_request(
     request.signature.clear();
     let signing_payload = canonical_session_request_payload(request);
     request.signature = keypair
+        .sign(&signing_payload)
+        .map_err(|_| SessionAuthError::SigningFailed)?;
+    Ok(())
+}
+
+pub fn sign_session_accept(
+    accept: &mut SessionAccept,
+    keypair: &identity::Keypair,
+) -> Result<(), SessionAuthError> {
+    accept.signature.clear();
+    let signing_payload = canonical_session_accept_payload(accept);
+    accept.signature = keypair
         .sign(&signing_payload)
         .map_err(|_| SessionAuthError::SigningFailed)?;
     Ok(())
@@ -291,8 +311,103 @@ pub fn verify_session_request(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn verify_session_accept(
+    accept: &SessionAccept,
+    transport_peer_id: Option<&PeerId>,
+    expected_session_id: Option<&str>,
+    expected_request_nonce: Option<&[u8]>,
+    now_unix_ms: i64,
+    allowed_skew_ms: i64,
+    replay_cache: &mut NonceReplayCache,
+    trusted_peers: &mut TrustedPeers,
+    trust_on_first_use: bool,
+) -> Result<VerifiedSessionPeer, SessionAuthError> {
+    if let Some(expected) = expected_session_id
+        && accept.session_id != expected
+    {
+        return Err(SessionAuthError::SessionIdMismatch {
+            expected: expected.to_string(),
+            got: accept.session_id.clone(),
+        });
+    }
+
+    if let Some(expected_nonce) = expected_request_nonce {
+        if accept.request_nonce.is_empty() {
+            return Err(SessionAuthError::MissingRequestNonceBinding);
+        }
+        if accept.request_nonce != expected_nonce {
+            return Err(SessionAuthError::RequestNonceMismatch);
+        }
+    }
+
+    let from = accept
+        .from
+        .as_ref()
+        .ok_or(SessionAuthError::MissingResponderIdentity)?;
+    if from.device_code.trim().is_empty() {
+        return Err(SessionAuthError::MissingDeviceCode);
+    }
+    if accept.nonce.is_empty() {
+        return Err(SessionAuthError::MissingNonce);
+    }
+    if accept.nonce.len() < MIN_NONCE_BYTES {
+        return Err(SessionAuthError::NonceTooShort {
+            min_bytes: MIN_NONCE_BYTES,
+        });
+    }
+
+    if (now_unix_ms - accept.unix_ms).abs() > allowed_skew_ms {
+        return Err(SessionAuthError::TimestampSkew {
+            request_unix_ms: accept.unix_ms,
+            now_unix_ms,
+            allowed_skew_ms,
+        });
+    }
+    replay_cache.check_and_store(&accept.nonce, now_unix_ms)?;
+
+    let sender_public_key = identity::PublicKey::try_decode_protobuf(&from.identity_pubkey)
+        .map_err(|_| SessionAuthError::InvalidSenderPublicKey)?;
+    let signing_payload = canonical_session_accept_payload(accept);
+    if !sender_public_key.verify(&signing_payload, &accept.signature) {
+        return Err(SessionAuthError::InvalidSignature);
+    }
+
+    let claimed_peer_id =
+        PeerId::from_bytes(&from.peer_id).map_err(|_| SessionAuthError::InvalidSenderPeerId)?;
+    let derived_peer_id = PeerId::from_public_key(&sender_public_key);
+    if claimed_peer_id != derived_peer_id {
+        return Err(SessionAuthError::PeerIdMismatch);
+    }
+    if let Some(bound_peer_id) = transport_peer_id
+        && *bound_peer_id != derived_peer_id
+    {
+        return Err(SessionAuthError::TransportPeerIdMismatch);
+    }
+
+    let trust_store_changed = trusted_peers.ensure_trusted(
+        &from.device_code,
+        &derived_peer_id,
+        &from.identity_pubkey,
+        now_unix_ms,
+        trust_on_first_use,
+    )?;
+
+    Ok(VerifiedSessionPeer {
+        peer_id: derived_peer_id,
+        device_code: from.device_code.clone(),
+        trust_store_changed,
+    })
+}
+
 fn canonical_session_request_payload(request: &SessionRequest) -> Vec<u8> {
     let mut stripped = request.clone();
+    stripped.signature.clear();
+    stripped.encode_to_vec()
+}
+
+fn canonical_session_accept_payload(accept: &SessionAccept) -> Vec<u8> {
+    let mut stripped = accept.clone();
     stripped.signature.clear();
     stripped.encode_to_vec()
 }
@@ -349,7 +464,9 @@ fn char_to_hex_nibble(c: char) -> Result<u8, SessionAuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aetherlink_proto::v1::{DeviceIdentity, ProtocolVersion, SessionRole, VideoCodec};
+    use aetherlink_proto::v1::{
+        DeviceIdentity, ProtocolVersion, SessionAccept, SessionRole, VideoCodec,
+    };
 
     fn make_signed_request(
         keypair: &identity::Keypair,
@@ -382,6 +499,35 @@ mod tests {
         };
         sign_session_request(&mut req, keypair).unwrap();
         req
+    }
+
+    fn make_signed_accept(
+        keypair: &identity::Keypair,
+        session_id: &str,
+        request_nonce: &[u8],
+        nonce: &[u8],
+        unix_ms: i64,
+    ) -> SessionAccept {
+        let mut accept = SessionAccept {
+            session_id: session_id.to_string(),
+            selected_codec: VideoCodec::H264 as i32,
+            selected_fps: 30,
+            selected_width: 1280,
+            selected_height: 720,
+            using_relay: false,
+            path_id: "direct-quic".to_string(),
+            from: Some(DeviceIdentity {
+                peer_id: PeerId::from(keypair.public()).to_bytes(),
+                identity_pubkey: keypair.public().encode_protobuf(),
+                device_code: PeerId::from(keypair.public()).to_string(),
+            }),
+            nonce: nonce.to_vec(),
+            unix_ms,
+            signature: Vec::new(),
+            request_nonce: request_nonce.to_vec(),
+        };
+        sign_session_accept(&mut accept, keypair).unwrap();
+        accept
     }
 
     #[test]
@@ -478,5 +624,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SessionAuthError::UntrustedPeer { .. }));
+    }
+
+    #[test]
+    fn session_accept_signature_and_binding_verified() {
+        let key = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(key.public());
+        let req_nonce = b"reqnonce01234567";
+        let accept = make_signed_accept(
+            &key,
+            "session-test",
+            req_nonce,
+            b"resnonce01234567",
+            1_000_000,
+        );
+
+        let mut replay = NonceReplayCache::default();
+        let mut trust = TrustedPeers::default();
+        let verified = verify_session_accept(
+            &accept,
+            Some(&peer_id),
+            Some("session-test"),
+            Some(req_nonce),
+            1_000_100,
+            DEFAULT_ALLOWED_SKEW_MS,
+            &mut replay,
+            &mut trust,
+            true,
+        )
+        .unwrap();
+        assert_eq!(verified.peer_id, peer_id);
+        assert!(verified.trust_store_changed);
+    }
+
+    #[test]
+    fn session_accept_request_nonce_mismatch_rejected() {
+        let key = identity::Keypair::generate_ed25519();
+        let peer_id = PeerId::from(key.public());
+        let accept = make_signed_accept(
+            &key,
+            "session-test",
+            b"reqnonce01234567",
+            b"resnonce01234567",
+            1_000_000,
+        );
+
+        let mut replay = NonceReplayCache::default();
+        let mut trust = TrustedPeers::default();
+        let err = verify_session_accept(
+            &accept,
+            Some(&peer_id),
+            Some("session-test"),
+            Some(b"differentnonce123"),
+            1_000_100,
+            DEFAULT_ALLOWED_SKEW_MS,
+            &mut replay,
+            &mut trust,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err, SessionAuthError::RequestNonceMismatch);
     }
 }
