@@ -2,6 +2,13 @@
 
 use thiserror::Error;
 
+pub mod security;
+pub use security::{
+    DEFAULT_ALLOWED_SKEW_MS, DEFAULT_REPLAY_RETENTION_MS, MIN_NONCE_BYTES, NonceReplayCache,
+    SessionAuthError, TrustedPeerRecord, TrustedPeers, VerifiedSessionPeer, sign_session_request,
+    verify_session_request,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimingProfile {
     pub discovery_timeout_ms: u64,
@@ -172,9 +179,10 @@ impl ConnectionStateMachine {
                 ConnectionState::DialingDirect,
                 Some((TimerKind::DirectDial, self.timing.direct_dial_budget_ms)),
             ),
-            (ConnectionState::Discovering, Trigger::DiscoveryTimeout) => {
-                (ConnectionState::Failed(FailureReason::DiscoveryTimeout), None)
-            }
+            (ConnectionState::Discovering, Trigger::DiscoveryTimeout) => (
+                ConnectionState::Failed(FailureReason::DiscoveryTimeout),
+                None,
+            ),
             (ConnectionState::DialingDirect, Trigger::DirectConnected) => (
                 ConnectionState::SecureHandshake,
                 Some((TimerKind::Handshake, self.timing.handshake_timeout_ms)),
@@ -206,9 +214,10 @@ impl ConnectionStateMachine {
             (ConnectionState::SecureHandshake, Trigger::AuthFailed) => {
                 (ConnectionState::Failed(FailureReason::AuthFailed), None)
             }
-            (ConnectionState::SecureHandshake, Trigger::VersionMismatch) => {
-                (ConnectionState::Failed(FailureReason::VersionMismatch), None)
-            }
+            (ConnectionState::SecureHandshake, Trigger::VersionMismatch) => (
+                ConnectionState::Failed(FailureReason::VersionMismatch),
+                None,
+            ),
             (ConnectionState::Active, Trigger::PathLost) => {
                 let wait = self.next_backoff_ms();
                 self.register_backoff_wait(wait);
@@ -245,7 +254,9 @@ impl ConnectionStateMachine {
             | (ConnectionState::DialingDirect, Trigger::UserHangup)
             | (ConnectionState::HolePunching, Trigger::UserHangup)
             | (ConnectionState::RelayDialing, Trigger::UserHangup)
-            | (ConnectionState::Discovering, Trigger::UserHangup) => (ConnectionState::Closed, None),
+            | (ConnectionState::Discovering, Trigger::UserHangup) => {
+                (ConnectionState::Closed, None)
+            }
             _ => {
                 return Err(StateMachineError::InvalidTransition {
                     from,
@@ -255,7 +266,11 @@ impl ConnectionStateMachine {
         };
 
         self.state = to.clone();
-        Ok(Transition { from, to, arm_timer })
+        Ok(Transition {
+            from,
+            to,
+            arm_timer,
+        })
     }
 }
 

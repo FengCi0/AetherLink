@@ -12,6 +12,8 @@ cargo build -p aetherlink-node >/dev/null
 echo "[2/3] Starting node A..."
 RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9901/quic-v1 \
+  --identity-file /tmp/aetherlink-node-a.key \
+  --trust-store-file /tmp/aetherlink-node-a-trust.json \
   > /tmp/aetherlink-node-a.log 2>&1 &
 PID_A=$!
 
@@ -25,6 +27,8 @@ sleep 1
 echo "[3/3] Starting node B (auto-request)..."
 RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9902/quic-v1 \
+  --identity-file /tmp/aetherlink-node-b.key \
+  --trust-store-file /tmp/aetherlink-node-b-trust.json \
   --dial /ip4/127.0.0.1/udp/9901/quic-v1 \
   --auto-request \
   > /tmp/aetherlink-node-b.log 2>&1 &
