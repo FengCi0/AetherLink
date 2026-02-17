@@ -19,6 +19,8 @@
 - QUIC 监听与拨号
 - mDNS 局域网发现
 - Kademlia 路由更新
+- DHT 设备公告发布（`device_code -> peer_id + addrs`）
+- 按设备码 DHT 查询并自动拨号
 - 控制协议 `SessionRequest/SessionAccept` 请求响应
 - 状态机驱动的连接状态推进（Idle -> Discovering -> ... -> Active）
 - `SessionRequest` / `SessionAccept` 双向签名与验签
@@ -71,11 +73,38 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 - `received SessionRequest`
 - `session accepted`
 
+按“设备码发现”方式运行（不手动 `--dial`，通过 DHT 查询设备码）：
+
+1) 先启动节点 A（记录其 `local peer id`，即设备码）  
+2) 启动节点 B：
+
+```bash
+. "$HOME/.cargo/env"
+RUST_LOG=info cargo run -p aetherlink-node -- \
+  --listen /ip4/127.0.0.1/udp/9902/quic-v1 \
+  --identity-file /tmp/aetherlink-node-b.key \
+  --trust-store-file /tmp/aetherlink-node-b-trust.json \
+  --bootstrap /ip4/127.0.0.1/udp/9901/quic-v1/p2p/<A_DEVICE_CODE> \
+  --connect-device-code <A_DEVICE_CODE> \
+  --auto-request
+```
+
+你会看到类似日志：
+
+- `published local device announcement to DHT`
+- `started DHT device lookup`
+- `device discovery hit`
+- `sent SessionRequest`
+- `session accepted`
+
 也可以直接运行演示脚本：
 
 ```bash
 . "$HOME/.cargo/env"
 ./scripts/demo_two_nodes.sh
+
+# DHT 设备码发现 + 自动连接演示
+./scripts/demo_device_code_discovery.sh
 ```
 
 ## 参数说明
@@ -89,6 +118,10 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 - `--trust-on-first-use <true|false>`：首次见到新设备是否自动信任（默认 `true`）
 - `--session-request-timeout-ms <ms>`：会话请求超时后重试间隔（默认 `1200`）
 - `--session-request-max-attempts <n>`：会话请求最大尝试次数（默认 `3`）
+- `--connect-device-code <code>`：按设备码持续发起 DHT 查询并自动拨号（可重复）
+- `--device-lookup-interval-ms <ms>`：设备码 DHT 查询间隔（默认 `2500`）
+- `--device-record-republish-ms <ms>`：本机设备公告重发间隔（默认 `15000`）
+- `--disable-device-record-publish`：禁用本机设备公告发布
 
 ## 现阶段边界
 

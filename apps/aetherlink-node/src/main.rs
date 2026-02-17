@@ -1,16 +1,16 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use aetherlink_core::{
-    ConnectionStateMachine, DEFAULT_ALLOWED_SKEW_MS, NonceReplayCache, SessionAuthError, Trigger,
-    TrustedPeerRecord, TrustedPeers, sign_session_accept, sign_session_request,
-    verify_session_accept, verify_session_request,
+    ConnectionState, ConnectionStateMachine, DEFAULT_ALLOWED_SKEW_MS, NonceReplayCache,
+    SessionAuthError, Trigger, TrustedPeerRecord, TrustedPeers, sign_session_accept,
+    sign_session_request, verify_session_accept, verify_session_request,
 };
 use aetherlink_proto::v1::{
     ControlEnvelope, DeviceIdentity, ProtocolVersion, RejectReason, SessionAccept, SessionReject,
@@ -34,6 +34,8 @@ use tracing::{info, warn};
 const CONTROL_PROTOCOL: &str = "/aetherlink/control/1.0.0";
 const PROTOCOL_MAJOR: u32 = 1;
 const TICK_INTERVAL_MS: u64 = 200;
+const DEVICE_RECORD_KEY_PREFIX: &str = "/aetherlink/device/v1/";
+const DISCOVERY_DIAL_COOLDOWN_MS: i64 = 2_500;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -96,6 +98,35 @@ struct Args {
         help = "Max SessionRequest attempts before failing"
     )]
     session_request_max_attempts: u32,
+
+    #[arg(
+        long,
+        value_name = "DEVICE_CODE",
+        help = "Target device code to discover via Kademlia and auto-dial (can repeat)"
+    )]
+    connect_device_code: Vec<String>,
+
+    #[arg(
+        long,
+        default_value_t = 2500,
+        help = "Device-code DHT lookup interval (milliseconds)"
+    )]
+    device_lookup_interval_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 15000,
+        help = "Local device announcement republish interval to DHT (milliseconds)"
+    )]
+    device_record_republish_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Disable publishing local device announcement record to DHT"
+    )]
+    disable_device_record_publish: bool,
 }
 
 #[derive(NetworkBehaviour)]
@@ -198,7 +229,34 @@ async fn main() -> Result<()> {
         args.trust_on_first_use,
         args.session_request_timeout_ms,
         args.session_request_max_attempts,
+        args.connect_device_code.clone(),
+        args.device_lookup_interval_ms,
+        args.device_record_republish_ms,
+        !args.disable_device_record_publish,
     );
+
+    if !app.connect_device_codes.is_empty() {
+        info!(
+            "device-code discovery targets: {:?}",
+            app.connect_device_codes
+        );
+        if args.bootstrap.is_empty() && args.dial.is_empty() {
+            warn!(
+                "device-code discovery configured without --bootstrap/--dial; DHT lookups may fail until some peers are known"
+            );
+        }
+    }
+    if app.connect_device_codes.is_empty() && !app.auto_request {
+        warn!("no auto session trigger set; use --auto-request, --dial, or --connect-device-code");
+    }
+
+    if !args.bootstrap.is_empty() {
+        match swarm.behaviour_mut().kad.bootstrap() {
+            Ok(query_id) => info!("kademlia bootstrap started, query={query_id:?}"),
+            Err(err) => warn!("kademlia bootstrap failed to start: {err}"),
+        }
+    }
+
     for addr in &args.dial {
         info!("dialing {addr}");
         if let Err(err) = swarm.dial(addr.clone()) {
@@ -213,18 +271,20 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = tick.tick() => {
                 handle_pending_session_timeouts(&mut swarm, &mut app);
+                handle_discovery_tick(&mut swarm, &mut app);
             }
             event = swarm.select_next_some() => {
                 match event {
                     libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
                         info!("listening on {address}");
+                        app.note_local_addr(address);
                     }
                     libp2p::swarm::SwarmEvent::ConnectionEstablished {
                         peer_id, endpoint, ..
                     } => {
                         info!("connection established with {peer_id} via {endpoint:?}");
                         app.on_connected(peer_id);
-                        if app.auto_request {
+                        if app.should_send_session_request(peer_id) {
                             if let Err(err) = send_session_request(&mut swarm, &mut app, peer_id) {
                                 warn!("failed to send SessionRequest to {peer_id}: {err}");
                             }
@@ -293,6 +353,16 @@ struct App {
     trust_on_first_use: bool,
     session_request_timeout_ms: i64,
     session_request_max_attempts: u32,
+    connect_device_codes: Vec<String>,
+    device_lookup_interval_ms: i64,
+    device_record_republish_ms: i64,
+    publish_device_record: bool,
+    known_local_addrs: Vec<Multiaddr>,
+    pending_device_lookup_queries: HashMap<kad::QueryId, String>,
+    pending_device_publish_queries: HashSet<kad::QueryId>,
+    last_device_lookup_unix_ms: HashMap<String, i64>,
+    last_device_record_publish_unix_ms: i64,
+    last_peer_dial_unix_ms: HashMap<PeerId, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +371,15 @@ struct PendingOutboundSession {
     request_nonces: Vec<Vec<u8>>,
     last_send_unix_ms: i64,
     attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceAnnouncementV1 {
+    version: u32,
+    device_code: String,
+    peer_id: String,
+    addrs: Vec<String>,
+    unix_ms: i64,
 }
 
 impl App {
@@ -313,7 +392,20 @@ impl App {
         trust_on_first_use: bool,
         session_request_timeout_ms: u64,
         session_request_max_attempts: u32,
+        connect_device_codes: Vec<String>,
+        device_lookup_interval_ms: u64,
+        device_record_republish_ms: u64,
+        publish_device_record: bool,
     ) -> Self {
+        let mut connect_device_codes = connect_device_codes
+            .into_iter()
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>();
+        connect_device_codes.sort();
+        connect_device_codes.dedup();
+        connect_device_codes.retain(|x| x != &local_peer_id.to_string());
+
         Self {
             local_key,
             local_peer_id,
@@ -327,7 +419,74 @@ impl App {
             trust_on_first_use,
             session_request_timeout_ms: session_request_timeout_ms.max(100) as i64,
             session_request_max_attempts: session_request_max_attempts.max(1),
+            connect_device_codes,
+            device_lookup_interval_ms: device_lookup_interval_ms.max(500) as i64,
+            device_record_republish_ms: device_record_republish_ms.max(2_000) as i64,
+            publish_device_record,
+            known_local_addrs: Vec::new(),
+            pending_device_lookup_queries: HashMap::new(),
+            pending_device_publish_queries: HashSet::new(),
+            last_device_lookup_unix_ms: HashMap::new(),
+            last_device_record_publish_unix_ms: 0,
+            last_peer_dial_unix_ms: HashMap::new(),
         }
+    }
+
+    fn note_local_addr(&mut self, addr: Multiaddr) {
+        if !self
+            .known_local_addrs
+            .iter()
+            .any(|existing| existing == &addr)
+        {
+            self.known_local_addrs.push(addr);
+        }
+    }
+
+    fn should_auto_request_for_peer(&self, peer_id: PeerId) -> bool {
+        if !self.auto_request {
+            return false;
+        }
+        if self.connect_device_codes.is_empty() {
+            return true;
+        }
+        self.connect_device_codes
+            .iter()
+            .any(|code| code == &peer_id.to_string())
+    }
+
+    fn should_send_session_request(&self, peer_id: PeerId) -> bool {
+        if !self.should_auto_request_for_peer(peer_id) {
+            return false;
+        }
+        if self.pending_outbound_sessions.contains_key(&peer_id) {
+            return false;
+        }
+        if let Some(sm) = self.sessions.get(&peer_id)
+            && matches!(sm.state(), ConnectionState::Active)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn can_attempt_discovery_dial(&self, swarm: &Swarm<NodeBehaviour>, peer_id: PeerId) -> bool {
+        if swarm.is_connected(&peer_id) {
+            return false;
+        }
+        if self.pending_outbound_sessions.contains_key(&peer_id) {
+            return false;
+        }
+        if let Some(last) = self.last_peer_dial_unix_ms.get(&peer_id) {
+            if unix_ms() as i64 - *last < DISCOVERY_DIAL_COOLDOWN_MS {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mark_discovery_dial_attempt(&mut self, peer_id: PeerId) {
+        self.last_peer_dial_unix_ms
+            .insert(peer_id, unix_ms() as i64);
     }
 
     fn on_connected(&mut self, peer_id: PeerId) {
@@ -396,6 +555,11 @@ async fn handle_behaviour_event(
         NodeEvent::Identify(ev) => {
             if let identify::Event::Received { peer_id, info, .. } = *ev {
                 info!("identify from {peer_id}: protocols={:?}", info.protocols);
+                for addr in info.listen_addrs {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                }
+                swarm.add_external_address(info.observed_addr.clone());
+                app.note_local_addr(info.observed_addr);
             }
         }
         NodeEvent::Mdns(mdns::Event::Discovered(peers)) => {
@@ -413,7 +577,7 @@ async fn handle_behaviour_event(
             }
         }
         NodeEvent::Kad(ev) => {
-            info!("kad event: {ev:?}");
+            handle_kad_event(swarm, app, *ev)?;
         }
         NodeEvent::Control(request_response::Event::Message { peer, message, .. }) => match message
         {
@@ -563,6 +727,254 @@ fn handle_pending_session_timeouts(swarm: &mut Swarm<NodeBehaviour>, app: &mut A
         warn!("SessionRequest retry budget exhausted for {peer_id}");
         app.on_auth_failed(peer_id);
     }
+}
+
+fn handle_discovery_tick(swarm: &mut Swarm<NodeBehaviour>, app: &mut App) {
+    if let Err(err) = maybe_publish_local_device_record(swarm, app) {
+        warn!("publish local device announcement failed: {err}");
+    }
+    maybe_start_device_code_lookups(swarm, app);
+}
+
+fn maybe_publish_local_device_record(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+) -> Result<()> {
+    if !app.publish_device_record {
+        return Ok(());
+    }
+
+    let now_unix_ms = unix_ms() as i64;
+    if now_unix_ms.saturating_sub(app.last_device_record_publish_unix_ms)
+        < app.device_record_republish_ms
+    {
+        return Ok(());
+    }
+
+    let mut addrs = app.known_local_addrs.clone();
+    for addr in swarm.external_addresses() {
+        if !addrs.iter().any(|existing| existing == addr) {
+            addrs.push(addr.clone());
+        }
+    }
+    let announcement = DeviceAnnouncementV1 {
+        version: 1,
+        device_code: app.local_device_code.clone(),
+        peer_id: app.local_peer_id.to_string(),
+        addrs: addrs.into_iter().map(|x| x.to_string()).collect(),
+        unix_ms: now_unix_ms,
+    };
+    let payload = serde_json::to_vec(&announcement).context("serialize announcement failed")?;
+    let key = device_record_key(&app.local_device_code);
+    let record = kad::Record::new(key, payload);
+    match swarm
+        .behaviour_mut()
+        .kad
+        .put_record(record, kad::Quorum::One)
+    {
+        Ok(query_id) => {
+            app.pending_device_publish_queries.insert(query_id);
+            app.last_device_record_publish_unix_ms = now_unix_ms;
+            info!(
+                "published local device announcement to DHT, query={query_id:?}, addrs={}",
+                announcement.addrs.len()
+            );
+        }
+        Err(err) => {
+            app.last_device_record_publish_unix_ms = now_unix_ms;
+            warn!("unable to publish local device announcement: {err}");
+        }
+    }
+
+    Ok(())
+}
+
+fn maybe_start_device_code_lookups(swarm: &mut Swarm<NodeBehaviour>, app: &mut App) {
+    if app.connect_device_codes.is_empty() {
+        return;
+    }
+    let now_unix_ms = unix_ms() as i64;
+    let pending_targets = app
+        .pending_device_lookup_queries
+        .values()
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    for target in app.connect_device_codes.clone() {
+        if pending_targets.contains(&target) {
+            continue;
+        }
+        let last_lookup = app
+            .last_device_lookup_unix_ms
+            .get(&target)
+            .copied()
+            .unwrap_or(0);
+        if now_unix_ms.saturating_sub(last_lookup) < app.device_lookup_interval_ms {
+            continue;
+        }
+        let key = device_record_key(&target);
+        let query_id = swarm.behaviour_mut().kad.get_record(key);
+        app.pending_device_lookup_queries
+            .insert(query_id, target.clone());
+        app.last_device_lookup_unix_ms
+            .insert(target.clone(), now_unix_ms);
+        info!("started DHT device lookup target={target}, query={query_id:?}");
+    }
+}
+
+fn handle_kad_event(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    event: kad::Event,
+) -> Result<()> {
+    match event {
+        kad::Event::OutboundQueryProgressed { id, result, .. } => {
+            handle_kad_query_progress(swarm, app, id, result)?;
+        }
+        kad::Event::RoutingUpdated {
+            peer,
+            is_new_peer,
+            old_peer,
+            ..
+        } => {
+            info!("kad routing update peer={peer} is_new={is_new_peer} evicted={old_peer:?}");
+        }
+        other => info!("kad event: {other:?}"),
+    }
+    Ok(())
+}
+
+fn handle_kad_query_progress(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    query_id: kad::QueryId,
+    result: kad::QueryResult,
+) -> Result<()> {
+    match result {
+        kad::QueryResult::Bootstrap(result) => match result {
+            Ok(ok) => info!(
+                "kademlia bootstrap progress peer={} num_remaining={}",
+                ok.peer, ok.num_remaining
+            ),
+            Err(err) => warn!("kademlia bootstrap error: {err}"),
+        },
+        kad::QueryResult::GetRecord(result) => {
+            handle_get_record_query_result(swarm, app, query_id, result)?;
+        }
+        kad::QueryResult::PutRecord(result) | kad::QueryResult::RepublishRecord(result) => {
+            if app.pending_device_publish_queries.remove(&query_id) {
+                match result {
+                    Ok(ok) => info!(
+                        "local device announcement record stored, key={}",
+                        String::from_utf8_lossy(ok.key.as_ref())
+                    ),
+                    Err(err) => warn!("local device announcement publish failed: {err}"),
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_get_record_query_result(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    query_id: kad::QueryId,
+    result: kad::GetRecordResult,
+) -> Result<()> {
+    let Some(target_device_code) = app.pending_device_lookup_queries.get(&query_id).cloned() else {
+        return Ok(());
+    };
+
+    match result {
+        Ok(kad::GetRecordOk::FoundRecord(record)) => {
+            process_discovery_record_payload(swarm, app, &target_device_code, &record.record.value)?
+        }
+        Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+            app.pending_device_lookup_queries.remove(&query_id);
+            info!("finished DHT lookup for device_code={target_device_code}");
+        }
+        Err(err) => {
+            app.pending_device_lookup_queries.remove(&query_id);
+            warn!("DHT lookup failed for device_code={target_device_code}: {err}");
+        }
+    }
+    Ok(())
+}
+
+fn process_discovery_record_payload(
+    swarm: &mut Swarm<NodeBehaviour>,
+    app: &mut App,
+    target_device_code: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let announcement: DeviceAnnouncementV1 = serde_json::from_slice(payload)
+        .context("decode DeviceAnnouncementV1 from DHT record failed")?;
+    if announcement.version != 1 {
+        warn!(
+            "ignore unsupported device announcement version={}",
+            announcement.version
+        );
+        return Ok(());
+    }
+    if announcement.device_code != target_device_code {
+        warn!(
+            "ignore device announcement with mismatched code: expected={}, got={}",
+            target_device_code, announcement.device_code
+        );
+        return Ok(());
+    }
+
+    let peer_id: PeerId = announcement
+        .peer_id
+        .parse()
+        .context("parse peer id from device announcement failed")?;
+    if peer_id == app.local_peer_id {
+        return Ok(());
+    }
+    if !app.can_attempt_discovery_dial(swarm, peer_id) {
+        info!(
+            "device discovery resolved target={} peer={} (already connected or throttled)",
+            target_device_code, peer_id
+        );
+        return Ok(());
+    }
+
+    let mut dialed_any = false;
+    for addr_str in announcement.addrs {
+        let addr = match addr_str.parse::<Multiaddr>() {
+            Ok(x) => x,
+            Err(err) => {
+                warn!("ignore invalid discovery multiaddr '{addr_str}': {err}");
+                continue;
+            }
+        };
+        let dial_addr = ensure_addr_has_peer_id(addr, peer_id);
+        swarm
+            .behaviour_mut()
+            .kad
+            .add_address(&peer_id, dial_addr.clone());
+        info!(
+            "device discovery hit: code={} peer={} trying addr={}",
+            target_device_code, peer_id, dial_addr
+        );
+        match swarm.dial(dial_addr.clone()) {
+            Ok(()) => {
+                dialed_any = true;
+                break;
+            }
+            Err(err) => warn!(
+                "dial from device discovery failed peer={} addr={} err={}",
+                peer_id, dial_addr, err
+            ),
+        }
+    }
+
+    if dialed_any {
+        app.mark_discovery_dial_attempt(peer_id);
+    }
+    Ok(())
 }
 
 fn handle_control_request(
@@ -897,6 +1309,18 @@ fn map_auth_error_to_reject(err: &SessionAuthError) -> RejectReason {
         | SessionAuthError::RequestNonceMismatch
         | SessionAuthError::TrustStoreCorrupt(_) => RejectReason::AuthFailed,
     }
+}
+
+fn device_record_key(device_code: &str) -> kad::RecordKey {
+    let trimmed = device_code.trim();
+    kad::RecordKey::new(&format!("{DEVICE_RECORD_KEY_PREFIX}{trimmed}"))
+}
+
+fn ensure_addr_has_peer_id(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
+    if extract_peer_id(&addr).is_none() {
+        addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+    }
+    addr
 }
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
