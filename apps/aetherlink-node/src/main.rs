@@ -33,6 +33,7 @@ use tracing::{info, warn};
 
 const CONTROL_PROTOCOL: &str = "/aetherlink/control/1.0.0";
 const PROTOCOL_MAJOR: u32 = 1;
+const TICK_INTERVAL_MS: u64 = 200;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,6 +82,20 @@ struct Args {
         help = "Trust-on-first-use for unknown peers"
     )]
     trust_on_first_use: bool,
+
+    #[arg(
+        long,
+        default_value_t = 1200,
+        help = "SessionRequest timeout before retry (milliseconds)"
+    )]
+    session_request_timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Max SessionRequest attempts before failing"
+    )]
+    session_request_max_attempts: u32,
 }
 
 #[derive(NetworkBehaviour)]
@@ -181,6 +196,8 @@ async fn main() -> Result<()> {
         trust_store_path,
         trusted_peers,
         args.trust_on_first_use,
+        args.session_request_timeout_ms,
+        args.session_request_max_attempts,
     );
     for addr in &args.dial {
         info!("dialing {addr}");
@@ -189,36 +206,46 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut tick = tokio::time::interval(Duration::from_millis(TICK_INTERVAL_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        match swarm.select_next_some().await {
-            libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-                info!("listening on {address}");
+        tokio::select! {
+            _ = tick.tick() => {
+                handle_pending_session_timeouts(&mut swarm, &mut app);
             }
-            libp2p::swarm::SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
-            } => {
-                info!("connection established with {peer_id} via {endpoint:?}");
-                app.on_connected(peer_id);
-                if app.auto_request {
-                    if let Err(err) = send_session_request(&mut swarm, &mut app, peer_id) {
-                        warn!("failed to send SessionRequest to {peer_id}: {err}");
+            event = swarm.select_next_some() => {
+                match event {
+                    libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
+                        info!("listening on {address}");
                     }
+                    libp2p::swarm::SwarmEvent::ConnectionEstablished {
+                        peer_id, endpoint, ..
+                    } => {
+                        info!("connection established with {peer_id} via {endpoint:?}");
+                        app.on_connected(peer_id);
+                        if app.auto_request {
+                            if let Err(err) = send_session_request(&mut swarm, &mut app, peer_id) {
+                                warn!("failed to send SessionRequest to {peer_id}: {err}");
+                            }
+                        }
+                    }
+                    libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                        warn!("connection closed with {peer_id}, cause: {cause:?}");
+                        app.on_disconnected(peer_id);
+                    }
+                    libp2p::swarm::SwarmEvent::Behaviour(event) => {
+                        handle_behaviour_event(&mut swarm, &mut app, event).await?;
+                    }
+                    libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        warn!("outgoing connection error for peer {peer_id:?}: {error}");
+                    }
+                    libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
+                        warn!("incoming connection error: {error}");
+                    }
+                    _ => {}
                 }
             }
-            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                warn!("connection closed with {peer_id}, cause: {cause:?}");
-                app.on_disconnected(peer_id);
-            }
-            libp2p::swarm::SwarmEvent::Behaviour(event) => {
-                handle_behaviour_event(&mut swarm, &mut app, event).await?;
-            }
-            libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                warn!("outgoing connection error for peer {peer_id:?}: {error}");
-            }
-            libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
-                warn!("incoming connection error: {error}");
-            }
-            _ => {}
         }
     }
 }
@@ -264,12 +291,16 @@ struct App {
     trusted_peers: TrustedPeers,
     trust_store_path: PathBuf,
     trust_on_first_use: bool,
+    session_request_timeout_ms: i64,
+    session_request_max_attempts: u32,
 }
 
 #[derive(Debug, Clone)]
 struct PendingOutboundSession {
     session_id: String,
-    request_nonce: Vec<u8>,
+    request_nonces: Vec<Vec<u8>>,
+    last_send_unix_ms: i64,
+    attempts: u32,
 }
 
 impl App {
@@ -280,6 +311,8 @@ impl App {
         trust_store_path: PathBuf,
         trusted_peers: TrustedPeers,
         trust_on_first_use: bool,
+        session_request_timeout_ms: u64,
+        session_request_max_attempts: u32,
     ) -> Self {
         Self {
             local_key,
@@ -292,6 +325,8 @@ impl App {
             trusted_peers,
             trust_store_path,
             trust_on_first_use,
+            session_request_timeout_ms: session_request_timeout_ms.max(100) as i64,
+            session_request_max_attempts: session_request_max_attempts.max(1),
         }
     }
 
@@ -323,6 +358,25 @@ impl App {
 
     fn persist_trust_store(&self) -> Result<()> {
         save_trusted_peers(&self.trust_store_path, &self.trusted_peers)
+    }
+
+    fn collect_pending_retry_actions(&self, now_unix_ms: i64) -> (Vec<PeerId>, Vec<PeerId>) {
+        let mut retry = Vec::new();
+        let mut fail = Vec::new();
+
+        for (peer_id, pending) in &self.pending_outbound_sessions {
+            if now_unix_ms.saturating_sub(pending.last_send_unix_ms)
+                < self.session_request_timeout_ms
+            {
+                continue;
+            }
+            if pending.attempts < self.session_request_max_attempts {
+                retry.push(*peer_id);
+            } else {
+                fail.push(*peer_id);
+            }
+        }
+        (retry, fail)
     }
 }
 
@@ -411,10 +465,63 @@ fn send_session_request(
     app: &mut App,
     peer_id: PeerId,
 ) -> Result<()> {
-    let session_id = format!("session-{}", unix_ms());
+    let now_unix_ms = unix_ms() as i64;
+    let session_id = app
+        .pending_outbound_sessions
+        .get(&peer_id)
+        .map(|p| p.session_id.clone())
+        .unwrap_or_else(|| format!("session-{now_unix_ms}"));
     let request_nonce = random_nonce(16);
+    let req = build_session_request(
+        app,
+        peer_id,
+        &session_id,
+        request_nonce.clone(),
+        now_unix_ms,
+    )?;
+
+    let env = ControlEnvelope {
+        seq: now_unix_ms as u64,
+        request_id: format!("req-{now_unix_ms}"),
+        message: Some(aetherlink_proto::v1::control_envelope::Message::SessionRequest(req)),
+    };
+    let request_id = swarm
+        .behaviour_mut()
+        .control
+        .send_request(&peer_id, encode_envelope(&env));
+
+    let pending = app
+        .pending_outbound_sessions
+        .entry(peer_id)
+        .or_insert(PendingOutboundSession {
+            session_id,
+            request_nonces: Vec::new(),
+            last_send_unix_ms: 0,
+            attempts: 0,
+        });
+    pending.last_send_unix_ms = now_unix_ms;
+    pending.attempts = pending.attempts.saturating_add(1);
+    pending.request_nonces.push(request_nonce);
+    if pending.request_nonces.len() > app.session_request_max_attempts as usize {
+        pending.request_nonces.remove(0);
+    }
+
+    info!(
+        "sent SessionRequest to peer={peer_id}, req={request_id:?}, attempt={}",
+        pending.attempts
+    );
+    Ok(())
+}
+
+fn build_session_request(
+    app: &App,
+    peer_id: PeerId,
+    session_id: &str,
+    request_nonce: Vec<u8>,
+    now_unix_ms: i64,
+) -> Result<SessionRequest> {
     let mut req = SessionRequest {
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         from: Some(DeviceIdentity {
             peer_id: app.local_peer_id.to_bytes(),
             identity_pubkey: app.local_key.public().encode_protobuf(),
@@ -427,8 +534,8 @@ fn send_session_request(
         preferred_max_fps: 30,
         preferred_max_width: 1280,
         preferred_max_height: 720,
-        nonce: request_nonce.clone(),
-        unix_ms: unix_ms() as i64,
+        nonce: request_nonce,
+        unix_ms: now_unix_ms,
         signature: Vec::new(),
         version: Some(ProtocolVersion {
             major: PROTOCOL_MAJOR,
@@ -437,26 +544,25 @@ fn send_session_request(
         }),
     };
     sign_session_request(&mut req, &app.local_key).context("sign SessionRequest")?;
+    Ok(req)
+}
 
-    let env = ControlEnvelope {
-        seq: unix_ms(),
-        request_id: format!("req-{}", unix_ms()),
-        message: Some(aetherlink_proto::v1::control_envelope::Message::SessionRequest(req)),
-    };
-    let payload = encode_envelope(&env);
-    let request_id = swarm
-        .behaviour_mut()
-        .control
-        .send_request(&peer_id, payload);
-    app.pending_outbound_sessions.insert(
-        peer_id,
-        PendingOutboundSession {
-            session_id,
-            request_nonce,
-        },
-    );
-    info!("sent SessionRequest to peer={peer_id}, req={request_id:?}");
-    Ok(())
+fn handle_pending_session_timeouts(swarm: &mut Swarm<NodeBehaviour>, app: &mut App) {
+    let now_unix_ms = unix_ms() as i64;
+    let (retry_peers, fail_peers) = app.collect_pending_retry_actions(now_unix_ms);
+
+    for peer_id in retry_peers {
+        warn!("SessionRequest timeout for {peer_id}, retrying");
+        if let Err(err) = send_session_request(swarm, app, peer_id) {
+            warn!("retry SessionRequest failed for {peer_id}: {err}");
+        }
+    }
+
+    for peer_id in fail_peers {
+        app.pending_outbound_sessions.remove(&peer_id);
+        warn!("SessionRequest retry budget exhausted for {peer_id}");
+        app.on_auth_failed(peer_id);
+    }
 }
 
 fn handle_control_request(
@@ -597,11 +703,26 @@ fn handle_control_response(app: &mut App, peer: PeerId, response: Vec<u8>) -> Re
                 return Ok(());
             };
 
+            if accept.request_nonce.is_empty() {
+                warn!("invalid SessionAccept from {peer}: missing request nonce binding");
+                app.on_auth_failed(peer);
+                return Ok(());
+            }
+            if !pending
+                .request_nonces
+                .iter()
+                .any(|nonce| nonce == &accept.request_nonce)
+            {
+                warn!("invalid SessionAccept from {peer}: request nonce mismatch");
+                app.on_auth_failed(peer);
+                return Ok(());
+            }
+
             let verified = match verify_session_accept(
                 &accept,
                 Some(&peer),
                 Some(&pending.session_id),
-                Some(&pending.request_nonce),
+                None,
                 unix_ms() as i64,
                 DEFAULT_ALLOWED_SKEW_MS,
                 &mut app.nonce_cache,

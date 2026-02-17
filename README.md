@@ -25,6 +25,7 @@
 - 防重放（nonce + 时间窗）
 - 传输层 peer id 与签名身份绑定校验
 - `SessionAccept` 与请求 nonce 绑定校验（防串会话响应）
+- 会话请求超时自动重试（可配置超时与重试次数）
 - TOFU 信任库（默认开启）持久化到 `~/.config/aetherlink/trusted_peers.json`
 
 ## 快速开始
@@ -86,6 +87,8 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
 - `--identity-file <path>`：指定设备私钥文件
 - `--trust-store-file <path>`：指定信任库 JSON 文件
 - `--trust-on-first-use <true|false>`：首次见到新设备是否自动信任（默认 `true`）
+- `--session-request-timeout-ms <ms>`：会话请求超时后重试间隔（默认 `1200`）
+- `--session-request-max-attempts <n>`：会话请求最大尝试次数（默认 `3`）
 
 ## 现阶段边界
 
