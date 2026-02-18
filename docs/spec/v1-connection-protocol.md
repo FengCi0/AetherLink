@@ -172,10 +172,13 @@ Core message groups:
 
 1. Session: `SessionRequest`, `SessionAccept`, `SessionReject`, `SessionClose`.
 2. Path setup: `CandidateAnnouncement`, `PunchSync`.
-3. Keepalive: `Ping`, `Pong`.
-4. Runtime config: `VideoConfigUpdate`.
-5. Input events: `InputEvent`.
-6. Telemetry and errors: `StatsReport`, `ErrorFrame`.
+3. Pairing and permissions: `PairingChallenge`, `PairingConfirm`, `PermissionGrant`, `PermissionRevoke`.
+4. Keepalive: `Ping`, `Pong`.
+5. Runtime config: `VideoConfigUpdate`.
+6. Input events: `InputEvent`.
+7. File transfer: `FileOffer`, `FileChunk`, `FileAck`, `FileCancel`.
+8. Clipboard and recording: `ClipboardFrame`, `RecordingStart`, `RecordingStop`, `RecordingStatus`.
+9. Telemetry and errors: `StatsReport`, `ErrorFrame`, `PathDecision`, `QualityReport`.
 
 ## 10. Security Rules (Mandatory)
 

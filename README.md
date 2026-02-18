@@ -1,163 +1,111 @@
-# AetherLink v0.4
+# AetherLink v1.0.0
 
-去中心化远控的可运行基础版本（Rust）。
+去中心化远控基础成品（Rust Core + Daemon IPC + Flutter Desktop Shell）。
 
-## 当前已交付
+## 本次交付重点
 
-- v1 控制协议与状态机规范：
-  - `docs/spec/v1-connection-protocol.md`
-- protobuf 协议定义：
-  - `proto/aetherlink/v1/control.proto`
-- Rust workspace：
-  - `crates/aetherlink-proto`：自动生成 protobuf 类型
-  - `crates/aetherlink-core`：连接状态机 + 安全握手核心（签名、验签、防重放、TOFU 信任）
-  - `apps/aetherlink-node`：可运行 P2P 节点（QUIC + mDNS + Kademlia + 控制面消息）
+- 协议升级到 v1：新增配对授权、文件传输、剪贴板、录制、路径诊断、质量报告消息。
+- 新增 `aetherlink-daemon`：本地后台守护进程（Unix Socket IPC，protobuf framed）。
+- 新增 `aetherlink-daemonctl`：可脚本化控制端（start/stop/discover/pair/connect/stats）。
+- 新增 `apps/aetherlink-flutter`：桌面 GUI 壳工程，直接驱动 daemonctl。
+- 原 `aetherlink-node` 升级为 `v1.0.0`，默认安全策略改为 `trust-on-first-use=false`。
 
-## 功能能力（v0.4）
+## Workspace 结构
 
-- 持久化本地设备身份（Ed25519，默认路径 `~/.config/aetherlink/device.key`）
-- QUIC 监听与拨号
-- mDNS 局域网发现
-- Kademlia 路由更新
-- DHT 设备公告发布（`device_code -> peer_id + addrs`）
-- 按设备码 DHT 查询并自动拨号
-- 控制协议 `SessionRequest/SessionAccept` 请求响应
-- 控制协议 `SessionClose`（会话关闭通知 + 状态收敛）
-- `CandidateAnnouncement` 交换候选地址并注入路由表
-- `PunchSync` 交换打洞时序并按计划触发拨号
-- 状态机驱动的连接状态推进（Idle -> Discovering -> ... -> Active）
-- `SessionRequest` / `SessionAccept` 双向签名与验签
-- 防重放（nonce + 时间窗）
-- 传输层 peer id 与签名身份绑定校验
-- `SessionAccept` 与请求 nonce 绑定校验（防串会话响应）
-- 会话请求超时自动重试（可配置超时与重试次数）
-- 控制面保活 Ping/Pong（可配置间隔、超时、连续丢失阈值）
-- TOFU 信任库（默认开启）持久化到 `~/.config/aetherlink/trusted_peers.json`
-- Linux X11 + H264 + UDP 媒体面脚本化 PoC（`ffmpeg`）
+- `crates/aetherlink-proto`
+  - protobuf 类型生成（`control.proto` + `ipc.proto`）
+- `crates/aetherlink-core`
+  - 状态机与会话安全（签名、验签、防重放、信任库）
+- `crates/aetherlink-network`
+  - 连接路径规划（直连/打洞/中继）与错误码映射
+- `crates/aetherlink-media`
+  - 媒体自适应码率策略与视频配置基础类型
+- `crates/aetherlink-input`
+  - 输入事件标准化与注入前校验
+- `apps/aetherlink-node`
+  - P2P 控制面节点（QUIC + mDNS + Kademlia）
+- `apps/aetherlink-daemon`
+  - 本地后台守护进程，管理 node 生命周期，提供 IPC 接口
+- `apps/aetherlink-daemonctl`
+  - 命令行控制器，供脚本和 GUI 调用
+- `apps/aetherlink-flutter`
+  - Flutter 桌面 UI 壳
+
+## 已实现能力（可运行）
+
+- 持久化设备身份（Ed25519）与信任库。
+- DHT 设备码发现、会话请求/接受/拒绝、会话关闭、Keepalive。
+- 候选地址公告与打洞时序同步（`CandidateAnnouncement` / `PunchSync`）。
+- v1 扩展协议消息定义（配对/权限/文件/剪贴板/录制/诊断）。
+- Daemon 本地 IPC 请求响应 + 事件通道（protobuf framed）。
+
+## 关键未完项（下一阶段）
+
+- 媒体链路内核（PipeWire/X11、DXGI、编码器调度）尚未并入 daemon 主链。
+- 系统级输入注入（XTest/SendInput/Wayland portal）尚在接线中。
+- Flutter 端当前通过 `daemonctl` 进程桥接，FRB 直连待补。
+- 安装包流水线（AppImage/DEB/EXE）尚未加入 CI。
 
 ## 快速开始
 
-要求：
-
-- Rust 工具链（建议 `rustup`）
-- `protoc` 已安装
-
-安装依赖并编译：
+### 1) 构建
 
 ```bash
 . "$HOME/.cargo/env"
 cargo build
 ```
 
-运行节点 A：
+### 2) 启动 daemon
 
 ```bash
 . "$HOME/.cargo/env"
-RUST_LOG=info cargo run -p aetherlink-node -- \
-  --listen /ip4/127.0.0.1/udp/9901/quic-v1 \
-  --identity-file /tmp/aetherlink-node-a.key \
-  --trust-store-file /tmp/aetherlink-node-a-trust.json
+RUST_LOG=info cargo run -p aetherlink-daemon -- \
+  --socket-path /tmp/aetherlink-daemon.sock
 ```
 
-运行节点 B（拨号 A 并自动发起会话）：
+### 3) 通过 daemonctl 启动受管 node
 
 ```bash
 . "$HOME/.cargo/env"
-RUST_LOG=info cargo run -p aetherlink-node -- \
-  --listen /ip4/127.0.0.1/udp/9902/quic-v1 \
-  --identity-file /tmp/aetherlink-node-b.key \
-  --trust-store-file /tmp/aetherlink-node-b-trust.json \
-  --dial /ip4/127.0.0.1/udp/9901/quic-v1 \
-  --auto-request
+cargo run -p aetherlink-daemonctl -- \
+  --socket-path /tmp/aetherlink-daemon.sock \
+  start \
+  --listen /ip4/0.0.0.0/udp/9000/quic-v1 \
+  --node-binary target/debug/aetherlink-node \
+  --trust-on-first-use false
 ```
 
-你会在日志看到：
-
-- `connection established`
-- `sent SessionRequest`
-- `received SessionRequest`
-- `session accepted`
-
-按“设备码发现”方式运行（不手动 `--dial`，通过 DHT 查询设备码）：
-
-1) 先启动节点 A（记录其 `local peer id`，即设备码）  
-2) 启动节点 B：
+### 4) 设备发现 / 配对 / 连接
 
 ```bash
 . "$HOME/.cargo/env"
-RUST_LOG=info cargo run -p aetherlink-node -- \
-  --listen /ip4/127.0.0.1/udp/9902/quic-v1 \
-  --identity-file /tmp/aetherlink-node-b.key \
-  --trust-store-file /tmp/aetherlink-node-b-trust.json \
-  --bootstrap /ip4/127.0.0.1/udp/9901/quic-v1/p2p/<A_DEVICE_CODE> \
-  --connect-device-code <A_DEVICE_CODE> \
-  --auto-request
+# 查询已知设备（来自信任库）
+cargo run -p aetherlink-daemonctl -- discover
+
+# 标记配对
+cargo run -p aetherlink-daemonctl -- pair --device-code <DEVICE_CODE> --approved true
+
+# 请求连接（daemon 会重启 node 并注入 --connect-device-code）
+cargo run -p aetherlink-daemonctl -- connect --device-code <DEVICE_CODE>
 ```
 
-你会看到类似日志：
+### 5) Flutter UI 壳（可选）
 
-- `published local device announcement to DHT`
-- `started DHT device lookup`
-- `device discovery hit` / `device discovery resolved target=...`
-- `sent SessionRequest`
-- `session accepted`
-
-也可以直接运行演示脚本：
+`apps/aetherlink-flutter` 为桌面端 UI 工程，调用 `aetherlink-daemonctl`。
 
 ```bash
-. "$HOME/.cargo/env"
-./scripts/demo_two_nodes.sh
-
-# DHT 设备码发现 + 自动连接演示
-./scripts/demo_device_code_discovery.sh
+cd apps/aetherlink-flutter
+flutter pub get
+flutter run -d linux
 ```
 
-Linux X11 + H264 + UDP 媒体面 PoC（脚本化）：
+## 协议文件
 
-```bash
-# 终端 1：接收端
-./scripts/media_poc_x11_h264_udp.sh receiver
-
-# 终端 2：发送端（默认抓取 :0.0 的 1280x720@15）
-./scripts/media_poc_x11_h264_udp.sh sender
-```
-
-或本机快速演示（自动起 receiver + sender）：
-
-```bash
-AETHERLINK_MEDIA_DEMO_SECONDS=10 ./scripts/media_poc_x11_h264_udp.sh demo
-```
-
-## 参数说明
-
-- `--listen <multiaddr>`：本地监听地址，默认 `/ip4/0.0.0.0/udp/9000/quic-v1`
-- `--dial <multiaddr>`：主动拨号地址，可重复
-- `--bootstrap <multiaddr-with-/p2p/>`：Kademlia 引导节点，可重复
-- `--auto-request`：连接建立后自动发送 `SessionRequest`
-- `--identity-file <path>`：指定设备私钥文件
-- `--trust-store-file <path>`：指定信任库 JSON 文件
-- `--trust-on-first-use <true|false>`：首次见到新设备是否自动信任（默认 `true`）
-- `--session-request-timeout-ms <ms>`：会话请求超时后重试间隔（默认 `1200`）
-- `--session-request-max-attempts <n>`：会话请求最大尝试次数（默认 `3`）
-- `--connect-device-code <code>`：按设备码持续发起 DHT 查询并自动拨号（可重复）
-- `--device-lookup-interval-ms <ms>`：设备码 DHT 查询间隔（默认 `2500`）
-- `--device-record-republish-ms <ms>`：本机设备公告重发间隔（默认 `15000`）
-- `--disable-device-record-publish`：禁用本机设备公告发布
-- `--control-keepalive-interval-ms <ms>`：控制面保活 Ping 发送间隔（默认 `1000`）
-- `--control-keepalive-timeout-ms <ms>`：控制面保活单次超时（默认 `1200`）
-- `--control-keepalive-max-misses <n>`：控制面保活连续丢失阈值，超过后断开并触发重连状态（默认 `3`）
-- `--session-auto-close-ms <ms>`：会话进入 Active 后自动发送 `SessionClose`（默认 `0`，关闭）
-
-## 现阶段边界
-
-这个版本是“网络与协议成品骨架”，还不是完整远控产品。以下还未实现：
-
-- 屏幕采集/编码/解码链路
-- 键鼠注入与权限编排
-- Flutter GUI 与 FRB 桥接
-- Relay/DCUtR/AutoNAT 实链路策略
-- 人工配对确认 UI（当前是 TOFU）
-- 媒体面加密密钥轮换与流控策略
+- 控制协议：`proto/aetherlink/v1/control.proto`
+- IPC 协议：`proto/aetherlink/v1/ipc.proto`
+- 连接状态机规范：`docs/spec/v1-connection-protocol.md`
+- Daemon IPC 说明：`docs/spec/v1-daemon-ipc.md`
+- Flutter Bridge 目标 API：`docs/spec/v1-frb-api.md`
 
 ## 测试
 
@@ -165,3 +113,10 @@ AETHERLINK_MEDIA_DEMO_SECONDS=10 ./scripts/media_poc_x11_h264_udp.sh demo
 . "$HOME/.cargo/env"
 cargo test
 ```
+
+## 版本说明
+
+当前代码版本为 `1.0.0`，定位为“v1 成品基座”：
+
+- 协议与本地控制平面接口已定版并可运行。
+- 媒体/输入完整链路与安装包流水线将在后续提交中持续完善。

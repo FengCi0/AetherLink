@@ -1,0 +1,172 @@
+syntax = "proto3";
+
+package aetherlink.v1;
+
+import "aetherlink/v1/control.proto";
+
+message DaemonStartRequest {
+  string node_binary = 1;
+  string listen_multiaddr = 2;
+  repeated string bootstrap_multiaddrs = 3;
+  bool trust_on_first_use = 4;
+}
+
+message DaemonStopRequest {}
+
+message DiscoverDevicesRequest {}
+
+message PairDeviceRequest {
+  string device_code = 1;
+  bool approved = 2;
+}
+
+message ConnectSessionRequest {
+  string device_code = 1;
+}
+
+message SendInputRequest {
+  InputEvent event = 1;
+}
+
+message StartFileTransferRequest {
+  string session_id = 1;
+  string source_path = 2;
+}
+
+message SetClipboardSyncRequest {
+  string session_id = 1;
+  bool enabled = 2;
+}
+
+message StartRecordingRequest {
+  string session_id = 1;
+  string output_path = 2;
+}
+
+message GetSessionStatsRequest {
+  string session_id = 1;
+}
+
+message DaemonRequest {
+  oneof payload {
+    DaemonStartRequest start_daemon = 1;
+    DaemonStopRequest stop_daemon = 2;
+    DiscoverDevicesRequest discover_devices = 3;
+    PairDeviceRequest pair_device = 4;
+    ConnectSessionRequest connect_session = 5;
+    SendInputRequest send_input = 6;
+    StartFileTransferRequest start_file_transfer = 7;
+    SetClipboardSyncRequest set_clipboard_sync = 8;
+    StartRecordingRequest start_recording = 9;
+    GetSessionStatsRequest get_session_stats = 10;
+  }
+}
+
+message GenericAck {
+  bool ok = 1;
+  string detail = 2;
+}
+
+message DiscoveredDevice {
+  string device_code = 1;
+  string peer_id = 2;
+  uint64 last_seen_unix_ms = 3;
+  bool trusted = 4;
+}
+
+message DiscoverDevicesResponse {
+  repeated DiscoveredDevice devices = 1;
+}
+
+message PairDeviceResponse {
+  bool paired = 1;
+  string detail = 2;
+}
+
+message ConnectSessionResponse {
+  string session_id = 1;
+  bool accepted = 2;
+  string detail = 3;
+}
+
+message SessionStats {
+  string session_id = 1;
+  uint32 rtt_ms = 2;
+  uint32 tx_bitrate_kbps = 3;
+  uint32 rx_bitrate_kbps = 4;
+  uint32 packet_loss_x10000 = 5;
+  uint32 encode_latency_ms = 6;
+  uint32 decode_latency_ms = 7;
+  bool using_relay = 8;
+}
+
+message GetSessionStatsResponse {
+  SessionStats stats = 1;
+}
+
+message DaemonResponse {
+  oneof payload {
+    GenericAck start_daemon = 1;
+    GenericAck stop_daemon = 2;
+    DiscoverDevicesResponse discover_devices = 3;
+    PairDeviceResponse pair_device = 4;
+    ConnectSessionResponse connect_session = 5;
+    GenericAck send_input = 6;
+    GenericAck start_file_transfer = 7;
+    GenericAck set_clipboard_sync = 8;
+    GenericAck start_recording = 9;
+    GetSessionStatsResponse get_session_stats = 10;
+  }
+}
+
+message DiscoveryUpdateEvent {
+  repeated DiscoveredDevice devices = 1;
+}
+
+message PairingRequiredEvent {
+  string device_code = 1;
+}
+
+message SessionStateEvent {
+  string session_id = 1;
+  string state = 2;
+  string detail = 3;
+}
+
+message StreamStatsEvent {
+  string session_id = 1;
+  SessionStats stats = 2;
+}
+
+message TransferProgressEvent {
+  string session_id = 1;
+  string transfer_id = 2;
+  uint64 sent_bytes = 3;
+  uint64 total_bytes = 4;
+}
+
+message ErrorEvent {
+  string code = 1;
+  string detail = 2;
+}
+
+message DaemonEvent {
+  oneof payload {
+    DiscoveryUpdateEvent discovery_update = 1;
+    PairingRequiredEvent pairing_required = 2;
+    SessionStateEvent session_state = 3;
+    StreamStatsEvent stream_stats = 4;
+    TransferProgressEvent transfer_progress = 5;
+    ErrorEvent error = 6;
+  }
+}
+
+message IpcEnvelope {
+  uint64 seq = 1;
+  string request_id = 2;
+  oneof payload {
+    DaemonRequest request = 10;
+    DaemonResponse response = 11;
+    DaemonEvent event = 12;
+  }
+}

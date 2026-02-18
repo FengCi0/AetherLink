@@ -1,11 +1,8 @@
 [package]
-name = "aetherlink-core"
+name = "aetherlink-input"
 version = "1.0.0"
 edition = "2024"
 
 [dependencies]
 aetherlink-proto.workspace = true
-libp2p.workspace = true
-prost.workspace = true
-serde.workspace = true
 thiserror.workspace = true

@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "aetherlink-core"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "aetherlink-proto",
  "libp2p",
@@ -49,8 +49,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "aetherlink-daemon"
+version = "1.0.0"
+dependencies = [
+ "aetherlink-core",
+ "aetherlink-proto",
+ "anyhow",
+ "clap",
+ "prost",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aetherlink-daemonctl"
+version = "1.0.0"
+dependencies = [
+ "aetherlink-proto",
+ "anyhow",
+ "clap",
+ "prost",
+ "tokio",
+]
+
+[[package]]
+name = "aetherlink-input"
+version = "1.0.0"
+dependencies = [
+ "aetherlink-proto",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "aetherlink-media"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "aetherlink-network"
+version = "1.0.0"
+dependencies = [
+ "aetherlink-core",
+ "aetherlink-proto",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "aetherlink-node"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "aetherlink-core",
  "aetherlink-proto",
@@ -69,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "aetherlink-proto"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "prost",
  "prost-build",

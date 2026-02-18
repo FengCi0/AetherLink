@@ -49,6 +49,39 @@ enum RejectReason {
   REJECT_REASON_TIMEOUT = 5;
 }
 
+enum PermissionType {
+  PERMISSION_TYPE_UNSPECIFIED = 0;
+  PERMISSION_TYPE_CONTROL = 1;
+  PERMISSION_TYPE_FILE_TRANSFER = 2;
+  PERMISSION_TYPE_CLIPBOARD = 3;
+  PERMISSION_TYPE_RECORDING = 4;
+}
+
+enum ClipboardFormat {
+  CLIPBOARD_FORMAT_UNSPECIFIED = 0;
+  CLIPBOARD_FORMAT_TEXT_UTF8 = 1;
+  CLIPBOARD_FORMAT_RTF = 2;
+  CLIPBOARD_FORMAT_IMAGE_PNG = 3;
+}
+
+enum PathType {
+  PATH_TYPE_UNSPECIFIED = 0;
+  PATH_TYPE_DIRECT = 1;
+  PATH_TYPE_HOLE_PUNCH = 2;
+  PATH_TYPE_RELAY = 3;
+}
+
+enum SessionErrorCode {
+  SESSION_ERROR_CODE_UNSPECIFIED = 0;
+  SESSION_ERROR_CODE_DISCOVERY_TIMEOUT = 1;
+  SESSION_ERROR_CODE_DIAL_TIMEOUT = 2;
+  SESSION_ERROR_CODE_HOLE_PUNCH_FAILED = 3;
+  SESSION_ERROR_CODE_RELAY_UNAVAILABLE = 4;
+  SESSION_ERROR_CODE_AUTH_FAILED = 5;
+  SESSION_ERROR_CODE_PERMISSION_DENIED = 6;
+  SESSION_ERROR_CODE_INTERNAL = 7;
+}
+
 enum InputSource {
   INPUT_SOURCE_UNSPECIFIED = 0;
   INPUT_SOURCE_MOUSE = 1;
@@ -78,6 +111,7 @@ message SessionRequest {
   int64 unix_ms = 11;
   bytes signature = 12;
   ProtocolVersion version = 13;
+  repeated string feature_bits = 14;
 }
 
 message SessionAccept {
@@ -93,6 +127,7 @@ message SessionAccept {
   int64 unix_ms = 10;
   bytes signature = 11;
   bytes request_nonce = 12;
+  repeated string accepted_feature_bits = 13;
 }
 
 message SessionReject {
@@ -118,6 +153,33 @@ message PunchSync {
   uint32 attempt_index = 4;
 }
 
+message PairingChallenge {
+  string session_id = 1;
+  string challenge_id = 2;
+  string short_code = 3;
+  uint64 expires_unix_ms = 4;
+  string controller_device_code = 5;
+  string target_device_code = 6;
+}
+
+message PairingConfirm {
+  string session_id = 1;
+  string challenge_id = 2;
+  bool approved = 3;
+  string detail = 4;
+}
+
+message PermissionGrant {
+  string session_id = 1;
+  repeated PermissionType permissions = 2;
+}
+
+message PermissionRevoke {
+  string session_id = 1;
+  repeated PermissionType permissions = 2;
+  string reason = 3;
+}
+
 message Ping {
   string session_id = 1;
   uint64 seq = 2;
@@ -139,6 +201,71 @@ message VideoConfigUpdate {
   uint32 max_height = 5;
   uint32 target_bitrate_kbps = 6;
   bool keyframe_request = 7;
+}
+
+message FileOffer {
+  string session_id = 1;
+  string transfer_id = 2;
+  string file_name = 3;
+  uint64 file_size = 4;
+  string sha256_hex = 5;
+  bool resumable = 6;
+}
+
+message FileChunk {
+  string session_id = 1;
+  string transfer_id = 2;
+  uint64 offset = 3;
+  bytes payload = 4;
+  bool eof = 5;
+}
+
+message FileAck {
+  string session_id = 1;
+  string transfer_id = 2;
+  uint64 next_offset = 3;
+  bool accepted = 4;
+  string detail = 5;
+}
+
+message FileCancel {
+  string session_id = 1;
+  string transfer_id = 2;
+  string reason = 3;
+}
+
+message ClipboardFrame {
+  string session_id = 1;
+  ClipboardFormat format = 2;
+  bytes payload = 3;
+  uint64 updated_unix_ms = 4;
+}
+
+message RecordingStart {
+  string session_id = 1;
+  string recording_id = 2;
+  string output_path = 3;
+}
+
+message RecordingStop {
+  string session_id = 1;
+  string recording_id = 2;
+  string reason = 3;
+}
+
+message RecordingStatus {
+  string session_id = 1;
+  string recording_id = 2;
+  bool active = 3;
+  uint64 bytes_written = 4;
+  uint64 duration_ms = 5;
+}
+
+message PathDecision {
+  string session_id = 1;
+  PathType path_type = 2;
+  string reason = 3;
+  uint64 unix_ms = 4;
 }
 
 message MouseEvent {
@@ -198,9 +325,21 @@ message StatsReport {
 
 message ErrorFrame {
   string session_id = 1;
-  uint32 code = 2;
+  SessionErrorCode code = 2;
   string message = 3;
   bool retryable = 4;
+}
+
+message QualityReport {
+  string session_id = 1;
+  uint32 rtt_ms = 2;
+  uint32 jitter_ms = 3;
+  uint32 packet_loss_x10000 = 4;
+  uint32 encode_latency_ms = 5;
+  uint32 decode_latency_ms = 6;
+  uint32 dropped_frames = 7;
+  uint32 tx_bitrate_kbps = 8;
+  uint32 rx_bitrate_kbps = 9;
 }
 
 message VideoChunk {
@@ -230,5 +369,19 @@ message ControlEnvelope {
     InputEvent input_event = 19;
     StatsReport stats_report = 20;
     ErrorFrame error = 21;
+    PairingChallenge pairing_challenge = 22;
+    PairingConfirm pairing_confirm = 23;
+    PermissionGrant permission_grant = 24;
+    PermissionRevoke permission_revoke = 25;
+    FileOffer file_offer = 26;
+    FileChunk file_chunk = 27;
+    FileAck file_ack = 28;
+    FileCancel file_cancel = 29;
+    ClipboardFrame clipboard_frame = 30;
+    RecordingStart recording_start = 31;
+    RecordingStop recording_stop = 32;
+    RecordingStatus recording_status = 33;
+    PathDecision path_decision = 34;
+    QualityReport quality_report = 35;
   }
 }

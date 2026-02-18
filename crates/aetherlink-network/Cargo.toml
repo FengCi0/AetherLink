@@ -1,11 +1,10 @@
 [package]
-name = "aetherlink-core"
+name = "aetherlink-network"
 version = "1.0.0"
 edition = "2024"
 
 [dependencies]
+aetherlink-core.workspace = true
 aetherlink-proto.workspace = true
-libp2p.workspace = true
-prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true

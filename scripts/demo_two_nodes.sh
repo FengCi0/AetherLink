@@ -14,6 +14,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9901/quic-v1 \
   --identity-file /tmp/aetherlink-node-a.key \
   --trust-store-file /tmp/aetherlink-node-a-trust.json \
+  --trust-on-first-use true \
   > /tmp/aetherlink-node-a.log 2>&1 &
 PID_A=$!
 
@@ -29,6 +30,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9902/quic-v1 \
   --identity-file /tmp/aetherlink-node-b.key \
   --trust-store-file /tmp/aetherlink-node-b-trust.json \
+  --trust-on-first-use true \
   --dial /ip4/127.0.0.1/udp/9901/quic-v1 \
   --auto-request \
   > /tmp/aetherlink-node-b.log 2>&1 &

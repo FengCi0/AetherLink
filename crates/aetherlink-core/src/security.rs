@@ -496,6 +496,7 @@ mod tests {
                 minor: 0,
                 patch: 0,
             }),
+            feature_bits: Vec::new(),
         };
         sign_session_request(&mut req, keypair).unwrap();
         req
@@ -525,6 +526,7 @@ mod tests {
             unix_ms,
             signature: Vec::new(),
             request_nonce: request_nonce.to_vec(),
+            accepted_feature_bits: Vec::new(),
         };
         sign_session_accept(&mut accept, keypair).unwrap();
         accept

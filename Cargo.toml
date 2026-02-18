@@ -2,18 +2,26 @@
 members = [
   "crates/aetherlink-proto",
   "crates/aetherlink-core",
+  "crates/aetherlink-network",
+  "crates/aetherlink-media",
+  "crates/aetherlink-input",
   "apps/aetherlink-node",
+  "apps/aetherlink-daemon",
+  "apps/aetherlink-daemonctl",
 ]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.4.0"
+version = "1.0.0"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
 aetherlink-core = { path = "crates/aetherlink-core" }
+aetherlink-input = { path = "crates/aetherlink-input" }
+aetherlink-media = { path = "crates/aetherlink-media" }
+aetherlink-network = { path = "crates/aetherlink-network" }
 aetherlink-proto = { path = "crates/aetherlink-proto" }
 bytes = "1.11.0"
 clap = { version = "4.5.53", features = ["derive"] }

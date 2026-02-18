@@ -42,7 +42,7 @@ const DISCOVERY_DIAL_COOLDOWN_MS: i64 = 2_500;
 #[command(
     name = "aetherlink-node",
     version,
-    about = "AetherLink P2P control node (v0.1)"
+    about = "AetherLink P2P control node (v1.0)"
 )]
 struct Args {
     #[arg(
@@ -67,7 +67,7 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "AetherLink-v0.1",
+        default_value = "AetherLink-v1.0.0",
         help = "Identify protocol version string"
     )]
     agent_version: String,
@@ -80,7 +80,7 @@ struct Args {
 
     #[arg(
         long,
-        default_value_t = true,
+        default_value_t = false,
         action = ArgAction::Set,
         help = "Trust-on-first-use for unknown peers"
     )]
@@ -980,6 +980,12 @@ fn build_session_request(
             minor: 0,
             patch: 0,
         }),
+        feature_bits: vec![
+            "pairing.confirm.v1".to_string(),
+            "file.transfer.v1".to_string(),
+            "clipboard.sync.v1".to_string(),
+            "recording.v1".to_string(),
+        ],
     };
     sign_session_request(&mut req, &app.local_key).context("sign SessionRequest")?;
     Ok(req)
@@ -1524,6 +1530,7 @@ fn handle_control_request(
                 unix_ms: unix_ms() as i64,
                 signature: Vec::new(),
                 request_nonce: req.nonce.clone(),
+                accepted_feature_bits: req.feature_bits.clone(),
             };
             sign_session_accept(&mut accept, &app.local_key).context("sign SessionAccept")?;
             let response = ControlEnvelope {

@@ -26,6 +26,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9910/quic-v1 \
   --identity-file "$KEY_SEED" \
   --trust-store-file "$TRUST_SEED" \
+  --trust-on-first-use true \
   >"$LOG_SEED" 2>&1 &
 PID_SEED=$!
 
@@ -51,6 +52,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9911/quic-v1 \
   --identity-file "$KEY_A" \
   --trust-store-file "$TRUST_A" \
+  --trust-on-first-use true \
   --bootstrap /ip4/127.0.0.1/udp/9910/quic-v1/p2p/"$PEER_SEED" \
   >"$LOG_A" 2>&1 &
 PID_A=$!
@@ -87,6 +89,7 @@ RUST_LOG=info cargo run -p aetherlink-node -- \
   --listen /ip4/127.0.0.1/udp/9912/quic-v1 \
   --identity-file "$KEY_B" \
   --trust-store-file "$TRUST_B" \
+  --trust-on-first-use true \
   --bootstrap /ip4/127.0.0.1/udp/9910/quic-v1/p2p/"$PEER_SEED" \
   --connect-device-code "$PEER_A" \
   --auto-request \
